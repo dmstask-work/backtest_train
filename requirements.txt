@@ -1,0 +1,20 @@
+# ============================================================
+# requirements.txt
+# Sistem Backtesting Adaptif — Dynamic Strategy Switching
+# Python 3.10+
+# ============================================================
+
+# Exchange connectivity
+ccxt>=4.2.0
+
+# Data manipulation (vectorized operations)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical indicators (vectorized, pandas-ta)
+# Catatan: pandas-ta 0.3.14b memiliki kompatibilitas terbaik.
+# Jika ada error dengan pandas 2.x, jalankan:
+#   pip install pandas-ta --upgrade
+#   atau
+#   pip install git+https://github.com/twopirllc/pandas-ta.git@development
+pandas-ta>=0.3.14b
