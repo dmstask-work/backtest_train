@@ -36,7 +36,7 @@ import pandas as pd
 
 from config import BACKTEST_CONFIG
 from risk_manager import RiskManager
-from signal_generator import SIGNAL_BUY
+from signal_generator import SIGNAL_BUY, SIGNAL_SELL
 
 logger = logging.getLogger(__name__)
 
@@ -153,13 +153,14 @@ class BacktestEngine:
             if (
                 not self._in_position
                 and not self._pending_order
-                and int(row.signal) == SIGNAL_BUY
+                and int(row.signal) in (SIGNAL_BUY, SIGNAL_SELL)
             ):
                 self._pending_order = {
                     "signal_time": idx,
                     "atr":         float(row.atr),
                     "strategy":    str(row.strategy_used),
                     "regime":      str(row.regime),
+                    "signal_type": int(row.signal),   # SIGNAL_BUY atau SIGNAL_SELL
                 }
                 logger.debug(
                     "[PENDING] %s | Signal diterima, menunggu open candle berikutnya.",
@@ -167,20 +168,27 @@ class BacktestEngine:
                 )
 
         # ── Tutup paksa posisi yang masih terbuka di akhir data ───────
-        # Slippage diterapkan: close * (1 - slippage_rate)
         if self._in_position:
-            last       = df.iloc[-1]
-            eod_price  = float(last["close"]) * (1.0 - self.slippage_rate)
+            last    = df.iloc[-1]
+            is_long = self._position["position_type"] == "LONG"
+            # LONG: jual di bawah close (slippage degrades sell)
+            # SHORT: beli-balik di atas close (slippage degrades buy-back)
+            eod_price = (
+                float(last["close"]) * (1.0 - self.slippage_rate) if is_long
+                else float(last["close"]) * (1.0 + self.slippage_rate)
+            )
             logger.info(
-                "[BacktestEngine] Menutup posisi aktif di akhir data | "
+                "[BacktestEngine] Menutup posisi %s di akhir data | "
                 "Close: $%.4f | Exec (after slippage): $%.4f",
+                "LONG" if is_long else "SHORT",
                 float(last["close"]),
                 eod_price,
             )
             self._close_position(
-                idx        = df.index[-1],
-                exec_price = eod_price,
-                exit_reason= "END_OF_DATA",
+                idx               = df.index[-1],
+                exec_price        = eod_price,
+                exit_reason       = "END_OF_DATA",
+                theoretical_price = float(last["close"]),
             )
 
         # Pending order yang tidak sempat dieksekusi dibuang (tidak ada data lagi)
@@ -231,13 +239,21 @@ class BacktestEngine:
             idx: Timestamp candle eksekusi (open[i+1]).
             row: Named tuple baris DataFrame candle saat ini.
         """
-        raw_open:   float = float(row.open)
-        exec_price: float = raw_open * (1.0 + self.slippage_rate)
+        raw_open: float = float(row.open)
+        is_long:  bool  = self._pending_order["signal_type"] == SIGNAL_BUY
 
-        # SL/TP dikalkulasi dari exec_price (bukan raw open)
+        # LONG : membeli  → slippage menaikkan harga beli  (exec > open)
+        # SHORT: menjual  → slippage menurunkan harga jual (exec < open)
+        exec_price: float = (
+            raw_open * (1.0 + self.slippage_rate) if is_long
+            else raw_open * (1.0 - self.slippage_rate)
+        )
+
+        # SL/TP dikalkulasi dari exec_price dengan arah posisi yang benar
         levels = self.risk_manager.calculate_levels(
             entry_price = exec_price,
             atr         = self._pending_order["atr"],
+            direction   = "LONG" if is_long else "SHORT",
         )
         sizing = self.risk_manager.calculate_position_size(
             capital        = self._capital,
@@ -250,9 +266,10 @@ class BacktestEngine:
         self._position = {
             "signal_time":     self._pending_order["signal_time"],
             "entry_time":      idx,
+            "position_type":   "LONG" if is_long else "SHORT",
             "raw_entry_price": raw_open,
             "entry_price":     exec_price,          # harga eksekusi nyata
-            "slippage_entry":  exec_price - raw_open,
+            "slippage_entry":  abs(exec_price - raw_open),
             "quantity":        sizing["quantity"],
             "trade_capital":   sizing["trade_capital"],
             "entry_fee":       sizing["entry_fee"],
@@ -268,12 +285,13 @@ class BacktestEngine:
         self._pending_order = {}   # Hapus pending order yang sudah dieksekusi
 
         logger.debug(
-            "[ENTRY] %s | Open: $%.4f → Exec: $%.4f (+slip $%.4f) | "
+            "[ENTRY %s] %s | Open: $%.4f → Exec: $%.4f (slip $%.4f) | "
             "SL: $%.4f | TP: $%.4f | %s",
+            "LONG" if is_long else "SHORT",
             idx,
             raw_open,
             exec_price,
-            exec_price - raw_open,
+            abs(exec_price - raw_open),
             levels["stop_loss"],
             levels["take_profit"],
             self._position["strategy"],
@@ -283,62 +301,86 @@ class BacktestEngine:
         """
         Mengevaluasi kondisi exit dengan resolusi intrabar pessimistik.
 
-        PERUBAHAN KRITIS dari v2:
-          Jika high[i] >= TP DAN low[i] <= SL dalam candle yang sama,
-          sebelumnya TP dianggap menang (optimistic). Kini SL selalu
-          diprioritas (pessimistic worst-case), karena dalam kondisi
-          volatilitas tinggi harga sangat mungkin menembus SL lebih dulu.
+        Logika hit SL/TP dibedakan berdasarkan arah posisi:
+          LONG  → hit_sl = low  ≤ SL  |  hit_tp = high ≥ TP
+          SHORT → hit_sl = high ≥ SL  |  hit_tp = low  ≤ TP
 
-        Slippage diterapkan ke harga eksekusi exit:
-          SL exit: exec = sl_price  * (1 - slippage_rate)  [lebih buruk]
-          TP exit: exec = tp_price  * (1 - slippage_rate)  [sedikit lebih buruk]
+        Resolusi pessimistik (institutional worst-case):
+          Jika kedua level tersentuh dalam satu candle → SL selalu menang.
+
+        Slippage pada exit (arah berlawanan dengan entry):
+          LONG  exit : exec = theoretical × (1 − slippage)  [jual lebih murah]
+          SHORT exit : exec = theoretical × (1 + slippage)  [beli-balik lebih mahal]
 
         Args:
             idx: Timestamp candle saat ini.
             row: Named tuple baris DataFrame.
         """
-        hit_tp: bool = float(row.high) >= self._position["take_profit"]
-        hit_sl: bool = float(row.low)  <= self._position["stop_loss"]
+        is_long: bool  = self._position["position_type"] == "LONG"
+        sl:      float = self._position["stop_loss"]
+        tp:      float = self._position["take_profit"]
+
+        if is_long:
+            hit_sl: bool = float(row.low)  <= sl
+            hit_tp: bool = float(row.high) >= tp
+            # LONG exit: menjual → slippage menurunkan harga jual
+            sl_exec: float = sl * (1.0 - self.slippage_rate)
+            tp_exec: float = tp * (1.0 - self.slippage_rate)
+        else:
+            # SHORT: SL di atas entry (harga naik = rugi), TP di bawah entry
+            hit_sl = float(row.high) >= sl
+            hit_tp = float(row.low)  <= tp
+            # SHORT exit: beli-balik → slippage menaikkan harga beli
+            sl_exec = sl * (1.0 + self.slippage_rate)
+            tp_exec = tp * (1.0 + self.slippage_rate)
 
         if hit_sl and hit_tp:
-            # ── PESSIMISTIC: kedua level tersentuh dalam satu candle ──
-            # Asumsi: SL selalu kena lebih dulu (worst-case institutional)
+            # ── PESSIMISTIC: kedua level tersentuh — SL selalu menang ──
             logger.debug(
                 "[EXIT] %s | ⚠ SL & TP keduanya hit — resolusi PESSIMISTIC → SL",
                 idx,
             )
-            exec_price = self._position["stop_loss"] * (1.0 - self.slippage_rate)
-            self._close_position(idx, exec_price, "STOP_LOSS")
+            self._close_position(idx, sl_exec, "STOP_LOSS", sl)
 
         elif hit_sl:
-            exec_price = self._position["stop_loss"] * (1.0 - self.slippage_rate)
-            self._close_position(idx, exec_price, "STOP_LOSS")
+            self._close_position(idx, sl_exec, "STOP_LOSS", sl)
 
         elif hit_tp:
-            exec_price = self._position["take_profit"] * (1.0 - self.slippage_rate)
-            self._close_position(idx, exec_price, "TAKE_PROFIT")
+            self._close_position(idx, tp_exec, "TAKE_PROFIT", tp)
 
     def _close_position(
         self,
-        idx:         Any,
-        exec_price:  float,
-        exit_reason: str,
+        idx:               Any,
+        exec_price:        float,
+        exit_reason:       str,
+        theoretical_price: float = 0.0,
     ) -> None:
         """
         Menutup posisi aktif, menghitung PnL net, dan mencatat ke trade log.
 
-        PnL dihitung dari harga eksekusi aktual (sudah termasuk slippage),
-        bukan dari harga teori SL/TP. Fee exit dihitung dari nilai eksekusi.
+        PnL bersifat direksional:
+          LONG  → gross_pnl = (exit − entry) × qty   [profit saat harga naik]
+          SHORT → gross_pnl = (entry − exit) × qty   [profit saat harga turun]
 
         Args:
-            idx:         Timestamp penutupan posisi.
-            exec_price:  Harga eksekusi exit aktual (sudah terdegradasi slippage).
-            exit_reason: 'TAKE_PROFIT', 'STOP_LOSS', atau 'END_OF_DATA'.
+            idx:               Timestamp penutupan posisi.
+            exec_price:        Harga eksekusi exit aktual (sudah terdegradasi slippage).
+            exit_reason:       'TAKE_PROFIT', 'STOP_LOSS', atau 'END_OF_DATA'.
+            theoretical_price: Harga level SL/TP teori (sebelum slippage).
+                               Dipakai untuk menghitung slippage_exit diagnostik.
+                               Biarkan 0.0 jika tidak tersedia.
         """
-        pos = self._position
+        pos     = self._position
+        is_long = pos["position_type"] == "LONG"
 
-        exit_fee:   float = (pos["quantity"] * exec_price) * self.fee_rate
-        gross_pnl:  float = (exec_price - pos["entry_price"]) * pos["quantity"]
+        exit_fee:  float = (pos["quantity"] * exec_price) * self.fee_rate
+        # PnL direksional:
+        #   LONG : profit jika harga naik  → exit lebih tinggi dari entry
+        #   SHORT: profit jika harga turun → entry lebih tinggi dari exit
+        gross_pnl: float = (
+            (exec_price - pos["entry_price"]) * pos["quantity"] if is_long
+            else (pos["entry_price"] - exec_price) * pos["quantity"]
+        )
         total_fees: float = pos["entry_fee"] + exit_fee
         net_pnl:    float = gross_pnl - total_fees
 
@@ -350,7 +392,8 @@ class BacktestEngine:
             "signal_time":       pos["signal_time"],
             "entry_time":        pos["entry_time"],
             "exit_time":         idx,
-            # ── Harga ────────────────────────────────────────────────
+            # ── Arah & Harga ─────────────────────────────────────────
+            "position_type":     pos["position_type"],
             "raw_entry_price":   pos["raw_entry_price"],
             "entry_price":       pos["entry_price"],      # after slippage
             "exit_price":        exec_price,              # after slippage
@@ -367,13 +410,9 @@ class BacktestEngine:
             "total_fees":        total_fees,
             "net_pnl":           net_pnl,
             "outcome":           "WIN" if net_pnl > 0 else "LOSS",
-            # ── Diagnostik ───────────────────────────────────────────
+            # ── Diagnostik Slippage ───────────────────────────────────
             "slippage_entry":    pos["slippage_entry"],
-            "slippage_exit":     abs(exec_price - (
-                pos["stop_loss"] if exit_reason == "STOP_LOSS" else
-                pos["take_profit"] if exit_reason == "TAKE_PROFIT" else
-                exec_price / (1.0 - self.slippage_rate) * self.slippage_rate
-            )),
+            "slippage_exit":     abs(exec_price - theoretical_price) if theoretical_price else 0.0,
         }
 
         self._trades.append(trade_record)
@@ -381,7 +420,8 @@ class BacktestEngine:
         self._position    = {}
 
         logger.debug(
-            "[EXIT] %s | %s | Exec: $%.4f | Net PnL: $%+.4f | %s",
+            "[EXIT %s] %s | %s | Exec: $%.4f | Net PnL: $%+.4f | %s",
+            pos["position_type"],
             idx,
             exit_reason,
             exec_price,

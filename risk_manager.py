@@ -5,8 +5,11 @@ Menghitung level Stop Loss dan Take Profit menggunakan Average True Range
 sebagai satuan risiko dinamis yang menyesuaikan volatilitas pasar.
 
 Rumus:
-  Stop Loss  = Entry Price - (sl_multiplier × ATR)
-  Take Profit = Entry Price + (tp_multiplier × ATR)
+  LONG  → Stop Loss   = Entry − (sl_multiplier × ATR)
+           Take Profit = Entry + (tp_multiplier × ATR)
+
+  SHORT → Stop Loss   = Entry + (sl_multiplier × ATR)  ← SL di atas entry
+           Take Profit = Entry − (tp_multiplier × ATR)  ← TP di bawah entry
 
 Risk/Reward ratio default = 1 : 2  (SL=1.5×ATR, TP=3.0×ATR)
 """
@@ -53,13 +56,23 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Kalkulasi Level SL & TP
     # ------------------------------------------------------------------
-    def calculate_levels(self, entry_price: float, atr: float) -> dict:
+    def calculate_levels(
+        self,
+        entry_price: float,
+        atr:         float,
+        direction:   str = "LONG",
+    ) -> dict:
         """
         Menghitung level Stop Loss dan Take Profit untuk satu posisi.
 
+        Level SL/TP bersifat direksional:
+          LONG  → SL di bawah entry, TP di atas entry
+          SHORT → SL di atas entry, TP di bawah entry (level terbalik)
+
         Args:
-            entry_price: Harga masuk posisi (harga close saat sinyal muncul).
-            atr:         Nilai ATR pada candle yang sama.
+            entry_price: Harga eksekusi masuk posisi (sudah termasuk slippage).
+            atr:         Nilai ATR dari candle sinyal.
+            direction:   Arah posisi — 'LONG' atau 'SHORT'. Default: 'LONG'.
 
         Returns:
             Dictionary berisi:
@@ -67,12 +80,17 @@ class RiskManager:
               take_profit       (float): Harga TP
               risk_reward_ratio (float): Rasio reward dibagi risk
         """
-        stop_loss   = entry_price - (self.sl_multiplier * atr)
-        take_profit = entry_price + (self.tp_multiplier * atr)
+        sl_distance: float = self.sl_multiplier * atr
+        tp_distance: float = self.tp_multiplier * atr
 
-        risk   = entry_price - stop_loss
-        reward = take_profit - entry_price
-        rr_ratio = reward / risk if risk > 0 else 0.0
+        if direction == "LONG":
+            stop_loss   = entry_price - sl_distance
+            take_profit = entry_price + tp_distance
+        else:  # SHORT
+            stop_loss   = entry_price + sl_distance   # SL di atas entry
+            take_profit = entry_price - tp_distance   # TP di bawah entry
+
+        rr_ratio: float = tp_distance / sl_distance if sl_distance > 0 else 0.0
 
         return {
             "stop_loss":         stop_loss,
