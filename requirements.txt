@@ -17,4 +17,4 @@ numpy>=1.24.0
 #   pip install pandas-ta --upgrade
 #   atau
 #   pip install git+https://github.com/twopirllc/pandas-ta.git@development
-pandas-ta>=0.3.14b
+# pandas-ta>=0.3.14b

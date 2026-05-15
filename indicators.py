@@ -6,15 +6,19 @@ library pandas-ta. Tidak ada loop Python — semua operasi dikerjakan oleh
 NumPy/C di bawah hood sehingga sangat cepat.
 
 Indikator yang dihitung:
-  - ADX (14)         → Deteksi regime pasar
-  - EMA (20 & 50)    → Trend-following signal
-  - MACD (12,26,9)   → Konfirmasi momentum
-  - Bollinger Bands  → Mean-reversion signal
-  - RSI (14)         → Konfirmasi oversold/overbought
-  - ATR (14)         → Kalkulasi Stop Loss & Take Profit
+  - ADX (14)              → Deteksi regime pasar
+  - EMA (fast & slow)     → Trend-following signal
+  - MACD (12,26,9)        → Konfirmasi momentum
+  - Supertrend            → Filter anti-whipsaw trend-following
+  - Bollinger Bands       → Mean-reversion signal
+  - BB Bandwidth          → Filter anti-dump untuk mean-reversion
+  - RSI (14)              → Konfirmasi oversold/overbought
+  - ATR (14)              → Kalkulasi Stop Loss & Take Profit
+  - Volume SMA            → Filter volume untuk menolak fake breakout
 """
 
 import logging
+import re
 
 import pandas as pd
 import pandas_ta as ta
@@ -25,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Helper aman untuk mengambil kolom pandas_ta berdasarkan prefix
+# Helper aman untuk mengambil kolom pandas_ta berdasarkan prefix / regex
 # ---------------------------------------------------------------------------
 def _pick_col(result_df: pd.DataFrame, prefix: str) -> pd.Series:
     """
@@ -54,6 +58,33 @@ def _pick_col(result_df: pd.DataFrame, prefix: str) -> pd.Series:
     return result_df[matched[0]]
 
 
+def _pick_col_regex(result_df: pd.DataFrame, pattern: str) -> pd.Series:
+    """
+    Mengambil kolom pertama dari DataFrame hasil pandas_ta menggunakan regex.
+
+    Digunakan khusus untuk Supertrend di mana prefix 'SUPERT_' ambigu karena
+    pandas_ta juga menghasilkan kolom 'SUPERTd_', 'SUPERTl_', 'SUPERTs_'.
+
+    Args:
+        result_df: DataFrame kembalian dari fungsi pandas_ta.
+        pattern:   Regex pattern, contoh: r'^SUPERT_\\d' untuk kolom utama,
+                   r'^SUPERTd_' untuk kolom direction.
+
+    Returns:
+        Pandas Series kolom yang cocok dengan pattern.
+
+    Raises:
+        KeyError: Jika tidak ada kolom yang cocok.
+    """
+    matched = [c for c in result_df.columns if re.match(pattern, c)]
+    if not matched:
+        raise KeyError(
+            f"Kolom dengan pattern regex '{pattern}' tidak ditemukan. "
+            f"Kolom tersedia: {list(result_df.columns)}"
+        )
+    return result_df[matched[0]]
+
+
 # ---------------------------------------------------------------------------
 # Kelas Utama
 # ---------------------------------------------------------------------------
@@ -63,6 +94,12 @@ class IndicatorCalculator:
 
     Seluruh kalkulasi bersifat vectorized — tidak ada iterasi baris satu
     per satu. Baris yang mengandung NaN (periode warm-up) dihapus di akhir.
+
+    Indikator baru (v2):
+      - Supertrend          → Menggantikan sinyal whipsaw pada tren choppy
+      - BB Bandwidth        → Mendeteksi kondisi BB expanding (dump) untuk
+                              memblokir sinyal Mean-Reversion
+      - Volume SMA          → Filter konfirmasi volume untuk semua sinyal
     """
 
     def __init__(self, config: dict = INDICATOR_CONFIG) -> None:
@@ -70,7 +107,9 @@ class IndicatorCalculator:
         Inisialisasi kalkulator dengan parameter konfigurasi.
 
         Args:
-            config: Dictionary parameter indikator dari config.py.
+            config: Dictionary parameter indikator. Bisa berasal dari
+                    config.py (default) atau dari settings.json yang
+                    dimuat oleh main.py.
         """
         self.cfg = config
 
@@ -86,9 +125,12 @@ class IndicatorCalculator:
 
         Returns:
             DataFrame yang telah dilengkapi kolom-kolom indikator berikut:
-              adx, ema_fast, ema_slow, macd_line, macd_signal_line,
-              macd_histogram, bb_upper, bb_middle, bb_lower,
-              rsi, atr
+              adx, ema_fast, ema_slow,
+              macd_line, macd_signal_line, macd_histogram,
+              supertrend, supertrend_dir,
+              bb_upper, bb_middle, bb_lower, bb_bandwidth, bb_bandwidth_sma,
+              rsi, atr,
+              volume_sma
         """
         df = df.copy()
 
@@ -118,6 +160,20 @@ class IndicatorCalculator:
         df["macd_signal_line"] = _pick_col(macd_res, "MACDs_")
         df["macd_histogram"]   = _pick_col(macd_res, "MACDh_")
 
+        # ---- Supertrend (Anti-Whipsaw) --------------------------------
+        # supertrend_dir: +1 = harga di atas supertrend (bullish)
+        #                 -1 = harga di bawah supertrend (bearish)
+        st_res = ta.supertrend(
+            df["high"],
+            df["low"],
+            df["close"],
+            length=self.cfg["supertrend_period"],
+            multiplier=float(self.cfg["supertrend_multiplier"]),
+        )
+        # Kolom utama: SUPERT_N_M.M (garis), SUPERTd_N_M.M (direction)
+        df["supertrend"]     = _pick_col_regex(st_res, r"^SUPERT_\d")
+        df["supertrend_dir"] = _pick_col_regex(st_res, r"^SUPERTd_")
+
         # ---- Bollinger Bands -----------------------------------------
         bb_res = ta.bbands(
             df["close"],
@@ -128,6 +184,14 @@ class IndicatorCalculator:
         df["bb_middle"] = _pick_col(bb_res, "BBM_")
         df["bb_lower"]  = _pick_col(bb_res, "BBL_")
 
+        # ---- BB Bandwidth (Filter anti-dump Mean-Reversion) ----------
+        # Bandwidth = (BB_upper - BB_lower) / BB_middle
+        # Nilai tinggi → BB sedang expanding (dump/spike) → hindari MR
+        df["bb_bandwidth"]     = (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"]
+        df["bb_bandwidth_sma"] = df["bb_bandwidth"].rolling(
+            window=self.cfg["bb_period"]
+        ).mean()
+
         # ---- RSI (Relative Strength Index) ---------------------------
         df["rsi"] = ta.rsi(df["close"], length=self.cfg["rsi_period"])
 
@@ -137,6 +201,13 @@ class IndicatorCalculator:
             df["low"],
             df["close"],
             length=self.cfg["atr_period"],
+        )
+
+        # ---- Volume SMA (Konfirmasi Volume — filter fake breakout) ---
+        df["volume_sma"] = (
+            df["volume"]
+            .rolling(window=self.cfg["volume_sma_period"])
+            .mean()
         )
 
         # ---- Buang baris warm-up (NaN) -------------------------------

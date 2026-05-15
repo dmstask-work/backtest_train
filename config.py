@@ -16,7 +16,8 @@ EXCHANGE_MODE: str = "sandbox"  # pilihan: 'sandbox' | 'live'
 EXCHANGE_CONFIG: dict = {
     "sandbox": {
         "exchange_id": "binance",
-        "sandbox": True,
+        "sandbox": False,
+        "enableRateLimit": True,
         "apiKey": "",         # Isi dengan API key testnet jika diperlukan
         "secret": "",         # Isi dengan secret key testnet jika diperlukan
         "options": {
@@ -38,11 +39,11 @@ EXCHANGE_CONFIG: dict = {
 # Parameter Backtest
 # ============================================================
 BACKTEST_CONFIG: dict = {
-    "symbol": "BTC/USDT",
-    "timeframe": "1h",
-    "limit": 1000,              # Jumlah candle historis yang diambil
+    "symbol": "SOL/USDT",
+    "timeframe": "4h",
+    "limit": 5000,              # Jumlah candle historis yang diambil
     "initial_capital": 1000.0,  # Modal awal dalam USD
-    "trade_allocation": 0.10,   # Alokasi modal per trade: 10%
+    "trade_allocation": 0.20,   # Alokasi modal per trade: 10%
     "fee_rate": 0.001,          # Biaya transaksi per sisi: 0.1%
 }
 
@@ -63,9 +64,17 @@ INDICATOR_CONFIG: dict = {
     "macd_slow": 26,
     "macd_signal": 9,
 
+    # Supertrend (Anti-Whipsaw) — baru v2
+    "supertrend_period": 10,
+    "supertrend_multiplier": 3.0,
+
     # Bollinger Bands
     "bb_period": 20,
     "bb_std": 2.0,
+
+    # BB Bandwidth Expansion Filter — baru v2
+    # Nilai 1.2 = MR hanya aktif jika bandwidth < 120% dari rata-ratanya
+    "bb_bandwidth_expansion_factor": 1.2,
 
     # RSI
     "rsi_period": 14,
@@ -74,6 +83,9 @@ INDICATOR_CONFIG: dict = {
 
     # ATR - Risk Management
     "atr_period": 14,
+
+    # Volume SMA - Filter fake breakout — baru v2
+    "volume_sma_period": 20,
 }
 
 # ============================================================
