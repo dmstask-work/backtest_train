@@ -1,8 +1,9 @@
 """
-Grid Search Optimizer — Pencari Parameter Terbaik secara Otomatis.
+Grid Search Optimizer V3 — Pencari Parameter Terbaik untuk Long/Short Engine.
 
 Mengeksekusi backtest untuk setiap kombinasi parameter yang ditentukan
-dan menampilkan 5 kombinasi terbaik berdasarkan Net PnL.
+dan menampilkan Top N kombinasi terbaik berdasarkan metrik pilihan
+(default: Sharpe Ratio per-candle — prioritas risk-adjusted return).
 
 Cara menjalankan:
   python optimizer.py
@@ -10,16 +11,24 @@ Cara menjalankan:
 Opsi kustomisasi ada di bagian OPTIMIZER CONFIG di bawah ini.
 Tidak perlu mengubah kode lainnya.
 
+Pembaruan V3 (dibanding V2):
+  • Kedua strategi AKTIF: Trend-Following + Mean-Reversion (regime switching)
+  • Slippage dikonfigurasikan eksplisit (sesuai BacktestEngine v3)
+  • Grid diperluas: bb_std dan rsi_oversold masuk ke dalam pencarian
+  • Metrik Sharpe Ratio per-candle ditangkap dan ditampilkan
+  • Directional breakdown (Long WR% vs Short WR%) tersedia di rekomendasi
+  • SORT_BY default: 'sharpe_ratio' (risk-adjusted, bukan nominal PnL)
+
 Alur Kerja:
   1. Ambil data OHLCV SATU kali (hemat kuota API)
   2. Buat semua kombinasi parameter (grid) via itertools.product
-  3. Untuk setiap kombinasi:
+  3. Untuk setiap kombinasi yang valid:
        a. Hitung ulang indikator (vectorized, sangat cepat)
-       b. Klasifikasi regime (ADX)
-       c. Generate sinyal Trend-Following ONLY
-       d. Jalankan BacktestEngine
-       e. Catat metrik
-  4. Urutkan hasil, cetak Top 5
+       b. Klasifikasi regime (ADX threshold)
+       c. Generate sinyal LONG + SHORT via kedua strategi
+       d. Jalankan BacktestEngine v3 (slippage + pending order)
+       e. Catat metrik: PnL, Sharpe, WR, DD, PF, Long/Short breakdown
+  4. Urutkan hasil, cetak Top N
 """
 
 import itertools
@@ -31,7 +40,7 @@ from typing import Any
 
 import pandas as pd
 
-# Impor modul internal
+# ── Impor modul internal ─────────────────────────────────────────────────────
 from backtest_engine import BacktestEngine
 from config import BACKTEST_CONFIG, EXCHANGE_MODE, INDICATOR_CONFIG, RISK_CONFIG
 from data_fetcher import DataFetcher
@@ -48,36 +57,39 @@ from signal_generator import SignalGenerator
 # ── Data Source ───────────────────────────────────────────────────────
 OPT_SYMBOL:    str = "SOL/USDT"
 OPT_TIMEFRAME: str = "4h"
-OPT_LIMIT:     int = 8000        # Total candle historis (diambil 1x)
+OPT_LIMIT:     int = 8000          # Total candle historis (diambil 1×)
 OPT_MODE:      str = EXCHANGE_MODE
 
-# ── Parameter Backtest Tetap ──────────────────────────────────────────
+# ── Parameter Backtest Tetap (non-grid) ───────────────────────────────
 OPT_INITIAL_CAPITAL:  float = BACKTEST_CONFIG["initial_capital"]
-OPT_TRADE_ALLOCATION: float = 0.40   # 40% per trade
+OPT_TRADE_ALLOCATION: float = 0.40     # 40% per trade
 OPT_FEE_RATE:         float = BACKTEST_CONFIG["fee_rate"]
+OPT_SLIPPAGE_RATE:    float = 0.0005   # Konsisten dengan BacktestEngine v3
 
 # ── Rentang Parameter yang Dioptimasi (Grid) ──────────────────────────
+# Total kombinasi: 4 × 4 × 3 × 2 × 2 = 192 (sebelum filter EMA)
 PARAM_GRID: dict = {
-    "ema_fast":      [10, 15, 20, 25],
-    "ema_slow":      [40, 50, 60, 100],
-    "adx_threshold": [20, 25, 30],
+    "ema_fast":      [10, 15, 20, 25],      # Periode EMA cepat
+    "ema_slow":      [40, 50, 60, 100],     # Periode EMA lambat
+    "adx_threshold": [20, 25, 30],          # Batas ADX untuk regime TRENDING
+    "bb_std":        [2.0, 2.5],            # Std dev Bollinger Bands
+    "rsi_oversold":  [25, 30],              # Batas RSI oversold (MR LONG)
 }
 
 # ── Output ────────────────────────────────────────────────────────────
-TOP_N:        int  = 5       # Tampilkan N kombinasi terbaik
-SORT_BY:      str  = "net_pnl"  # Metrik pengurutan: 'net_pnl' | 'win_rate'
-SHOW_ALL:     bool = False   # True = tampilkan semua hasil, bukan hanya Top N
+TOP_N:    int  = 5       # Tampilkan N kombinasi terbaik
+SORT_BY:  str  = "sharpe_ratio"  # "sharpe_ratio" | "net_pnl" | "win_rate"
+SHOW_ALL: bool = False   # True = tampilkan semua hasil, bukan hanya Top N
 
 # ============================================================
-# Setup Logging
+# Setup Logging — Hanya optimizer yang INFO, semua modul diam
 # ============================================================
 logging.basicConfig(
-    level=logging.WARNING,   # Hanya tampilkan WARNING+ agar output bersih
+    level=logging.WARNING,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-# Logger khusus optimizer pada level INFO agar progress tetap terlihat
 opt_logger = logging.getLogger("optimizer")
 opt_logger.setLevel(logging.INFO)
 _handler = logging.StreamHandler(sys.stdout)
@@ -95,13 +107,13 @@ def _build_indicator_config(overrides: dict) -> dict:
     """
     Membuat salinan INDICATOR_CONFIG dengan nilai yang di-override.
 
-    Menggunakan deepcopy agar base config tidak termutasi selama looping.
+    Menggunakan deepcopy agar base config tidak termutasi selama loop.
 
     Args:
-        overrides: Dictionary parameter yang akan ditimpa.
+        overrides: Dictionary parameter yang akan menimpa nilai default.
 
     Returns:
-        Dictionary config indikator baru.
+        Dictionary config indikator baru untuk satu kombinasi grid.
     """
     cfg = deepcopy(INDICATOR_CONFIG)
     cfg.update(overrides)
@@ -109,28 +121,30 @@ def _build_indicator_config(overrides: dict) -> dict:
 
 
 def _run_single_backtest(
-    df_raw: pd.DataFrame,
+    df_raw:        pd.DataFrame,
     indicator_cfg: dict,
     adx_threshold: float,
 ) -> dict[str, Any]:
     """
     Menjalankan satu siklus backtest penuh untuk satu kombinasi parameter.
 
+    Menggunakan kedua strategi (Trend-Following + Mean-Reversion) untuk
+    mensimulasikan sistem regime-switching yang lengkap.
+
     Args:
-        df_raw:          DataFrame OHLCV mentah (sebelum kalkulasi indikator).
-        indicator_cfg:   Config indikator yang sudah di-override.
-        adx_threshold:   Nilai ADX threshold untuk regime filter.
+        df_raw:        DataFrame OHLCV mentah (sebelum kalkulasi indikator).
+        indicator_cfg: Config indikator yang sudah di-override untuk kombinasi ini.
+        adx_threshold: Nilai ADX threshold untuk regime filter.
 
     Returns:
-        Dictionary metrik performa: net_pnl, win_rate, max_drawdown,
-        total_trades, final_capital. Atau dict berisi 'error' jika gagal.
+        Dictionary metrik lengkap termasuk Sharpe dan directional breakdown,
+        atau dict berisi 'error' jika backtest gagal / tidak menghasilkan trade.
     """
     try:
         # ── Hitung Indikator (vectorized) ─────────────────────────────
         calculator = IndicatorCalculator(config=indicator_cfg)
         df = calculator.calculate_all(df_raw)
 
-        # ── Jika data terlalu sedikit setelah warm-up, skip ───────────
         if len(df) < 50:
             return {"error": "data_terlalu_sedikit"}
 
@@ -138,23 +152,25 @@ def _run_single_backtest(
         regime_filter = RegimeFilter(adx_threshold=adx_threshold)
         df = regime_filter.classify(df)
 
-        # ── Signal Generator: ONLY Trend-Following ────────────────────
+        # ── Signal Generator: KEDUA Strategi Aktif ───────────────────
+        # Trend-Following (LONG & SHORT) + Mean-Reversion (LONG & SHORT)
         signal_gen = SignalGenerator(
-            config=indicator_cfg,
-            enable_trend_following=True,
-            enable_mean_reversion=False,   # DIMATIKAN sesuai spesifikasi
+            config                = indicator_cfg,
+            enable_trend_following= True,
+            enable_mean_reversion = True,
         )
         df = signal_gen.generate(df)
 
-        # ── Backtest Engine ───────────────────────────────────────────
+        # ── Backtest Engine v3 ────────────────────────────────────────
         risk_manager = RiskManager(
-            sl_multiplier=RISK_CONFIG["sl_multiplier"],
-            tp_multiplier=RISK_CONFIG["tp_multiplier"],
+            sl_multiplier = RISK_CONFIG["sl_multiplier"],
+            tp_multiplier = RISK_CONFIG["tp_multiplier"],
         )
         engine = BacktestEngine(
             initial_capital  = OPT_INITIAL_CAPITAL,
             trade_allocation = OPT_TRADE_ALLOCATION,
             fee_rate         = OPT_FEE_RATE,
+            slippage_rate    = OPT_SLIPPAGE_RATE,   # eksplisit v3
             risk_manager     = risk_manager,
         )
         results = engine.run(df)
@@ -162,21 +178,34 @@ def _run_single_backtest(
         # ── Kalkulasi Metrik ──────────────────────────────────────────
         reporter = PerformanceReporter(initial_capital=OPT_INITIAL_CAPITAL)
         metrics  = reporter.calculate_metrics(
-            trades       = results["trades"],
-            equity_curve = results["equity_curve"],
-            final_capital= results["final_capital"],
+            trades        = results["trades"],
+            equity_curve  = results["equity_curve"],
+            final_capital = results["final_capital"],
         )
 
         if "error" in metrics:
             return {"error": metrics["error"]}
 
+        # ── Ekstrak Directional Breakdown ─────────────────────────────
+        dir_bd  = metrics.get("directional_breakdown", {})
+        long_d  = dir_bd.get("LONG",  {})
+        short_d = dir_bd.get("SHORT", {})
+
+        pf_raw = metrics["trade_stats"]["profit_factor"]
+
         return {
-            "net_pnl":      metrics["summary"]["total_net_pnl_usd"],
-            "win_rate":     metrics["trade_stats"]["win_rate_pct"],
-            "max_drawdown": metrics["risk_metrics"]["max_drawdown_pct"],
-            "total_trades": metrics["trade_stats"]["total_trades"],
-            "profit_factor": metrics["trade_stats"]["profit_factor"],
-            "final_capital": metrics["summary"]["final_capital_usd"],
+            "net_pnl":        metrics["summary"]["total_net_pnl_usd"],
+            "win_rate":       metrics["trade_stats"]["win_rate_pct"],
+            "sharpe_ratio":   metrics["risk_metrics"]["sharpe_ratio_per_candle"],
+            "max_drawdown":   metrics["risk_metrics"]["max_drawdown_pct"],
+            "total_trades":   metrics["trade_stats"]["total_trades"],
+            "profit_factor":  pf_raw if pf_raw is not None else 0.0,
+            "final_capital":  metrics["summary"]["final_capital_usd"],
+            # ── Directional ──────────────────────────────────────────
+            "long_trades":    long_d.get("total_trades",  0),
+            "long_win_rate":  long_d.get("win_rate_pct",  0.0),
+            "short_trades":   short_d.get("total_trades", 0),
+            "short_win_rate": short_d.get("win_rate_pct", 0.0),
         }
 
     except Exception as exc:  # noqa: BLE001
@@ -184,15 +213,15 @@ def _run_single_backtest(
 
 
 # ============================================================
-# Validasi Grid (filter kombinasi tidak logis)
+# Validasi Grid
 # ============================================================
 def _is_valid_combo(params: dict) -> bool:
     """
     Menyaring kombinasi parameter yang tidak masuk akal secara logis.
 
     Aturan:
-      - ema_fast harus lebih kecil dari ema_slow (minimal selisih 10)
-        agar ada gap yang berarti antara garis cepat dan lambat.
+      - ema_fast + 10 ≤ ema_slow: gap minimal 10 periode antara EMA
+        cepat dan lambat agar sinyal tren memiliki makna yang jelas.
 
     Args:
         params: Dictionary satu kombinasi parameter.
@@ -212,27 +241,34 @@ def run_optimizer() -> pd.DataFrame:
 
     Returns:
         DataFrame semua kombinasi valid yang berhasil diuji,
-        diurutkan berdasarkan SORT_BY (default: net_pnl) secara descending.
+        diurutkan berdasarkan SORT_BY secara descending.
     """
-    W = 70
+    W = 76
 
     print(f"\n{'=' * W}")
-    print(f"{'GRID SEARCH OPTIMIZER — ADAPTIVE BACKTEST SYSTEM':^{W}}")
+    print(f"{'GRID SEARCH OPTIMIZER V3 — LONG/SHORT REGIME-SWITCHING ENGINE':^{W}}")
     print(f"{'=' * W}")
-    print(f"  Symbol      : {OPT_SYMBOL}")
-    print(f"  Timeframe   : {OPT_TIMEFRAME}")
-    print(f"  Candle Limit: {OPT_LIMIT:,}")
-    print(f"  Alokasi     : {OPT_TRADE_ALLOCATION * 100:.0f}% per trade")
-    print(f"  Modal Awal  : ${OPT_INITIAL_CAPITAL:,.2f}")
-    print(f"  Strategi    : TREND-FOLLOWING ONLY")
-    print(f"  Grid        : ema_fast {PARAM_GRID['ema_fast']}")
-    print(f"              : ema_slow {PARAM_GRID['ema_slow']}")
-    print(f"              : adx_threshold {PARAM_GRID['adx_threshold']}")
+    print(f"  Symbol        : {OPT_SYMBOL}")
+    print(f"  Timeframe     : {OPT_TIMEFRAME}")
+    print(f"  Candle Limit  : {OPT_LIMIT:,}")
+    print(f"  Alokasi       : {OPT_TRADE_ALLOCATION * 100:.0f}% per trade")
+    print(f"  Modal Awal    : ${OPT_INITIAL_CAPITAL:,.2f}")
+    print(f"  Slippage      : {OPT_SLIPPAGE_RATE * 100:.2f}% per sisi")
+    print(f"  Strategi      : TREND-FOLLOWING + MEAN-REVERSION  (regime switching)")
+    print(f"  Urut berdasar : {SORT_BY.upper()}")
+    print(f"  Grid:")
+    print(f"    ema_fast      : {PARAM_GRID['ema_fast']}")
+    print(f"    ema_slow      : {PARAM_GRID['ema_slow']}")
+    print(f"    adx_threshold : {PARAM_GRID['adx_threshold']}")
+    print(f"    bb_std        : {PARAM_GRID['bb_std']}")
+    print(f"    rsi_oversold  : {PARAM_GRID['rsi_oversold']}")
     print(f"{'=' * W}\n")
 
     # ── FASE 1: Ambil Data SATU KALI ─────────────────────────────────
-    opt_logger.info("[FASE 1] Mengambil %d candle %s %s ...",
-                    OPT_LIMIT, OPT_SYMBOL, OPT_TIMEFRAME)
+    opt_logger.info(
+        "[FASE 1] Mengambil %d candle %s %s ...",
+        OPT_LIMIT, OPT_SYMBOL, OPT_TIMEFRAME,
+    )
     t_fetch_start = time.perf_counter()
 
     fetcher = DataFetcher(mode=OPT_MODE)
@@ -256,13 +292,12 @@ def run_optimizer() -> pd.DataFrame:
         for combo in itertools.product(*values)
     ]
 
-    # Filter kombinasi tidak logis (ema_fast >= ema_slow - 10)
     valid_combos = [c for c in all_combos if _is_valid_combo(c)]
     skipped      = len(all_combos) - len(valid_combos)
+    total        = len(valid_combos)
 
-    total = len(valid_combos)
     opt_logger.info(
-        "[FASE 2] Grid: %d total kombinasi | %d valid | %d di-skip (ema_fast ≥ ema_slow-10)",
+        "[FASE 2] Grid: %d total kombinasi | %d valid | %d di-skip (gap EMA < 10)",
         len(all_combos), total, skipped,
     )
 
@@ -276,22 +311,24 @@ def run_optimizer() -> pd.DataFrame:
         ema_f  = params["ema_fast"]
         ema_s  = params["ema_slow"]
         adx_th = params["adx_threshold"]
+        bb_s   = params["bb_std"]
+        rsi_os = params["rsi_oversold"]
 
-        # Progress indicator
         pct = (i / total) * 100
         print(
-            f"  [{i:>3}/{total}] ({pct:>5.1f}%) "
-            f"ema_fast={ema_f:>3} | ema_slow={ema_s:>3} | "
-            f"adx_threshold={adx_th:>2} ...",
+            f"  [{i:>3}/{total}] ({pct:>5.1f}%)  "
+            f"ef={ema_f:>2} es={ema_s:>3} adx={adx_th:>2} "
+            f"bs={bb_s:.1f} ro={rsi_os:>2}  ...",
             end="  ",
             flush=True,
         )
 
-        # Override config untuk kombinasi ini
         ind_cfg = _build_indicator_config({
             "ema_fast":      ema_f,
             "ema_slow":      ema_s,
             "adx_threshold": adx_th,
+            "bb_std":        bb_s,
+            "rsi_oversold":  rsi_os,
         })
 
         t0      = time.perf_counter()
@@ -299,34 +336,37 @@ def run_optimizer() -> pd.DataFrame:
         elapsed = time.perf_counter() - t0
 
         if "error" in outcome:
-            print(f"SKIP ({outcome['error']})")
+            print(f"SKIP  ({outcome['error']})")
             continue
 
         row = {
             "ema_fast":      ema_f,
             "ema_slow":      ema_s,
             "adx_threshold": adx_th,
+            "bb_std":        bb_s,
+            "rsi_oversold":  rsi_os,
             **outcome,
             "_time_s":       round(elapsed, 3),
         }
         results_log.append(row)
 
-        # Tampilkan ringkasan per baris
         print(
-            f"PnL: ${outcome['net_pnl']:>+8.2f} | "
-            f"WR: {outcome['win_rate']:>5.1f}% | "
-            f"DD: {outcome['max_drawdown']:>6.2f}% | "
-            f"Trades: {outcome['total_trades']:>3} | "
+            f"PnL: ${outcome['net_pnl']:>+8.2f}  "
+            f"WR: {outcome['win_rate']:>5.1f}%  "
+            f"Sharpe: {outcome['sharpe_ratio']:>7.4f}  "
+            f"DD: {outcome['max_drawdown']:>6.2f}%  "
+            f"T: {outcome['total_trades']:>3}  "
             f"{elapsed:.2f}s"
         )
 
     t_loop_elapsed = time.perf_counter() - t_loop_start
-
     print(f"\n  Iterasi selesai dalam {t_loop_elapsed:.1f} detik total.\n")
 
     if not results_log:
-        opt_logger.error("Tidak ada kombinasi yang menghasilkan trade. "
-                         "Coba perluas rentang parameter atau kurangi filter.")
+        opt_logger.error(
+            "Tidak ada kombinasi yang menghasilkan trade. "
+            "Coba perluas rentang parameter atau kurangi filter."
+        )
         sys.exit(1)
 
     # ── FASE 4: Ranking & Output ──────────────────────────────────────
@@ -346,63 +386,105 @@ def _print_top_results(df: pd.DataFrame, top_n: int) -> None:
     """
     Mencetak tabel Top N kombinasi parameter terbaik ke terminal.
 
+    Kolom tabel: EF, ES, ADX, BS, RO, Net PnL, WR%, Sharpe, MaxDD%, Trades, PF
+    Rekomendasi terbaik ditampilkan dengan detail directional (Long/Short WR).
+
     Args:
         df:    DataFrame hasil yang sudah diurutkan.
         top_n: Jumlah baris teratas yang ditampilkan.
     """
-    W   = 88
-    SEP = "=" * W
+    W     = 96
+    SEP   = "=" * W
     label = f"TOP {top_n}" if top_n < len(df) else "SEMUA HASIL"
 
     print(f"\n{SEP}")
-    print(f"  {label} KOMBINASI PARAMETER TERBAIK  "
-          f"(diurutkan berdasarkan: {SORT_BY.upper()})".center(W))
+    print(
+        f"  {label} KOMBINASI PARAMETER TERBAIK  "
+        f"(diurutkan: {SORT_BY.upper()})".center(W)
+    )
     print(SEP)
 
+    # ── Header tabel ──────────────────────────────────────────────────
+    # Kolom  : #(3) EF(4) ES(4) ADX(4) BS(5) RO(5) PnL(11) WR(6) Sharpe(8) DD(7) T(6) PF(6)
     header = (
         f"  {'#':>3}  "
-        f"{'EMA_F':>6}  {'EMA_S':>6}  {'ADX_TH':>6}  "
-        f"{'Net PnL':>10}  {'WR%':>6}  {'Max DD%':>8}  "
-        f"{'Trades':>7}  {'PF':>6}  {'Final $':>10}"
+        f"{'EF':>4}  {'ES':>4}  {'ADX':>4}  {'BS':>5}  {'RO':>5}  "
+        f"{'Net PnL':>11}  {'WR%':>6}  {'Sharpe':>8}  "
+        f"{'MaxDD%':>7}  {'Trades':>6}  {'PF':>6}"
     )
     print(header)
     print(f"  {'─' * (W - 4)}")
 
     for rank, (_, row) in enumerate(df.head(top_n).iterrows(), start=1):
-        pnl_sign = "+" if row["net_pnl"] >= 0 else ""
+        pf_val  = row["profit_factor"]
+        pf_str  = f"{pf_val:>6.2f}" if pf_val > 0 else f"{'0.00':>6}"
         print(
             f"  {rank:>3}  "
-            f"{int(row['ema_fast']):>6}  {int(row['ema_slow']):>6}  "
-            f"{int(row['adx_threshold']):>6}  "
-            f"${pnl_sign}{row['net_pnl']:>9.2f}  "
+            f"{int(row['ema_fast']):>4}  {int(row['ema_slow']):>4}  "
+            f"{int(row['adx_threshold']):>4}  "
+            f"{row['bb_std']:>5.1f}  {int(row['rsi_oversold']):>5}  "
+            f"${row['net_pnl']:>+10.2f}  "
             f"{row['win_rate']:>5.1f}%  "
-            f"{row['max_drawdown']:>7.2f}%  "
-            f"{int(row['total_trades']):>7}  "
-            f"{row['profit_factor']:>6.2f}  "
-            f"${row['final_capital']:>9.2f}"
+            f"{row['sharpe_ratio']:>8.4f}  "
+            f"{row['max_drawdown']:>6.2f}%  "
+            f"{int(row['total_trades']):>6}  "
+            f"{pf_str}"
         )
 
     print(SEP)
 
-    # Cetak #1 Terbaik secara detail
-    best = df.iloc[0]
-    print(f"\n  ★  REKOMENDASI TERBAIK:")
-    print(f"     ema_fast={int(best['ema_fast'])} | "
-          f"ema_slow={int(best['ema_slow'])} | "
-          f"adx_threshold={int(best['adx_threshold'])}")
-    print(f"     Net PnL  : ${best['net_pnl']:+.4f}")
-    print(f"     Win Rate : {best['win_rate']:.2f}%")
-    print(f"     Max DD   : {best['max_drawdown']:.2f}%")
-    print(f"     Trades   : {int(best['total_trades'])}")
-    print(f"     PF       : {best['profit_factor']:.4f}")
-    print(f"\n     → Untuk menerapkan: edit settings.json atau jalankan:")
+    # ── Rekomendasi Terbaik — Detail Lengkap ──────────────────────────
+    best   = df.iloc[0]
+    DASH_B = "─" * (W - 4)
+
+    print(f"\n  ★  REKOMENDASI TERBAIK  (#{1} dari {len(df)} kombinasi valid)")
+    print(f"  {DASH_B}")
+
+    # Parameter
+    print(f"  Parameter :")
+    print(f"    ema_fast      = {int(best['ema_fast']):<5}  "
+          f"ema_slow      = {int(best['ema_slow'])}")
+    print(f"    adx_threshold = {int(best['adx_threshold']):<5}  "
+          f"bb_std        = {best['bb_std']:.1f}")
+    print(f"    rsi_oversold  = {int(best['rsi_oversold'])}")
+
+    # Metrik agregat
+    print(f"  {DASH_B}")
+    print(f"  Metrik Agregat :")
+    print(f"    Net PnL       : ${best['net_pnl']:>+.4f}")
+    print(f"    Win Rate      :  {best['win_rate']:.2f}%")
+    print(f"    Sharpe Ratio  :  {best['sharpe_ratio']:.4f}  "
+          f"(per-candle | RF=0%)")
+    print(f"    Max Drawdown  :  {best['max_drawdown']:.2f}%")
+    print(f"    Profit Factor :  {best['profit_factor']:.4f}")
+    print(f"    Total Trades  :  {int(best['total_trades'])}")
+    print(f"    Final Capital : ${best['final_capital']:,.4f}")
+
+    # Directional breakdown
+    print(f"  {DASH_B}")
+    print(f"  Directional Breakdown :")
     print(
-        f"     python main.py --symbol {OPT_SYMBOL} --tf {OPT_TIMEFRAME} "
-        f"--alloc {OPT_TRADE_ALLOCATION} --no-meanrev"
+        f"    LONG   — {int(best['long_trades']):>3} trade(s)  |  "
+        f"Win Rate: {best['long_win_rate']:.1f}%"
     )
-    print(f"       (dan set ema_fast={int(best['ema_fast'])}, "
-          f"ema_slow={int(best['ema_slow'])}, "
-          f"adx_threshold={int(best['adx_threshold'])} di settings.json)")
+    print(
+        f"    SHORT  — {int(best['short_trades']):>3} trade(s)  |  "
+        f"Win Rate: {best['short_win_rate']:.1f}%"
+    )
+
+    # Command untuk menerapkan
+    print(f"  {DASH_B}")
+    print(f"  Untuk menerapkan — jalankan:")
+    print(
+        f"    python main.py --symbol {OPT_SYMBOL} --tf {OPT_TIMEFRAME} "
+        f"--alloc {OPT_TRADE_ALLOCATION}"
+    )
+    print(f"  Lalu update settings.json:")
+    print(
+        f"    ema_fast={int(best['ema_fast'])}, ema_slow={int(best['ema_slow'])}, "
+        f"adx_threshold={int(best['adx_threshold'])}, "
+        f"bb_std={best['bb_std']:.1f}, rsi_oversold={int(best['rsi_oversold'])}"
+    )
     print(f"{SEP}\n")
 
 
@@ -411,3 +493,4 @@ def _print_top_results(df: pd.DataFrame, top_n: int) -> None:
 # ============================================================
 if __name__ == "__main__":
     run_optimizer()
+
