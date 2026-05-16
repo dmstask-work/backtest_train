@@ -6,3 +6,5 @@ bot-env/
 logs/
 data/
 trade_history.csv
+
+run_paper.ps1
