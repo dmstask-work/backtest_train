@@ -6,10 +6,17 @@ dan menampilkan Top N kombinasi terbaik berdasarkan metrik pilihan
 (default: Sharpe Ratio per-candle — prioritas risk-adjusted return).
 
 Cara menjalankan:
-  python optimizer.py
+  python optimizer.py                                    # mode interaktif biasa
+  python optimizer.py --symbol BTC/USDT --auto-apply    # override + tulis settings
+  python optimizer.py --symbol ETH/USDT --timeframe 1h --limit 5000
 
-Opsi kustomisasi ada di bagian OPTIMIZER CONFIG di bawah ini.
-Tidak perlu mengubah kode lainnya.
+Argumen CLI (semua opsional):
+  --symbol      Override trading pair  (contoh: BTC/USDT)
+  --timeframe   Override timeframe     (contoh: 1h, 4h, 1d)
+  --limit       Override candle limit  (contoh: 5000)
+  --auto-apply  Jika di-set, parameter terbaik langsung ditulis ke settings.json
+
+Opsi kustomisasi statis ada di bagian OPTIMIZER CONFIG di bawah ini.
 
 Pembaruan V3 (dibanding V2):
   • Kedua strategi AKTIF: Trend-Following + Mean-Reversion (regime switching)
@@ -31,11 +38,14 @@ Alur Kerja:
   4. Urutkan hasil, cetak Top N
 """
 
+import argparse
 import itertools
+import json
 import logging
 import sys
 import time
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -233,9 +243,85 @@ def _is_valid_combo(params: dict) -> bool:
 
 
 # ============================================================
+# Auto-Apply — Tulis Parameter Terbaik ke settings.json
+# ============================================================
+
+# Path settings.json relatif terhadap file ini (bukan cwd)
+_SETTINGS_PATH = Path(__file__).parent / "settings.json"
+
+# Key indikator yang dikelola oleh optimizer (whitelist)
+_GRID_PARAM_KEYS: tuple[str, ...] = (
+    "ema_fast",
+    "ema_slow",
+    "adx_threshold",
+    "bb_std",
+    "rsi_oversold",
+)
+
+
+def _apply_best_params(best: "pd.Series") -> None:
+    """
+    Tulis parameter terbaik dari hasil optimizer ke dalam settings.json.
+
+    Hanya key yang terdaftar di _GRID_PARAM_KEYS yang diperbarui di dalam
+    objek ``"indicators"``. Semua bagian lain (exchange, backtest, risk,
+    _comment*, nested objects) dijaga utuh persis seperti semula.
+
+    File disimpan kembali dengan indent=2 (format standar).
+
+    Args:
+        best: Row pertama dari df_results (kombinasi parameter terbaik).
+    """
+    # ── Muat JSON yang ada, atau mulai dari dict kosong ───────────────
+    if _SETTINGS_PATH.exists():
+        try:
+            data: dict = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            opt_logger.error(
+                "Auto-apply GAGAL: tidak dapat mem-parse settings.json — %s", exc
+            )
+            return
+    else:
+        data = {}
+
+    # ── Pastikan section "indicators" ada ────────────────────────────
+    if "indicators" not in data:
+        data["indicators"] = {}
+
+    # ── Update hanya key yang dikelola optimizer ──────────────────────
+    winning: dict = {
+        "ema_fast":      int(best["ema_fast"]),
+        "ema_slow":      int(best["ema_slow"]),
+        "adx_threshold": int(best["adx_threshold"]),
+        "bb_std":        float(best["bb_std"]),
+        "rsi_oversold":  int(best["rsi_oversold"]),
+    }
+    for key, value in winning.items():
+        data["indicators"][key] = value
+
+    # ── Simpan kembali (preserves semua bagian lain + _comment keys) ──
+    _SETTINGS_PATH.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    # ── Konfirmasi terminal ───────────────────────────────────────────
+    W   = 96
+    SEP = "=" * W
+    print(f"\n{SEP}")
+    print(f"  AUTO-APPLY BERHASIL".center(W))
+    print(SEP)
+    print(f"  settings.json diperbarui → {_SETTINGS_PATH}")
+    print(f"  Parameter yang ditulis ke \"indicators\":")
+    for key, value in winning.items():
+        print(f"    {key:<20} = {value}")
+    print(f"{SEP}\n")
+
+
+# ============================================================
 # Fungsi Utama Optimizer
 # ============================================================
-def run_optimizer() -> pd.DataFrame:
+def run_optimizer(auto_apply: bool = False) -> pd.DataFrame:
     """
     Menjalankan Grid Search secara penuh dan mengembalikan DataFrame hasil.
 
@@ -376,6 +462,10 @@ def run_optimizer() -> pd.DataFrame:
 
     _print_top_results(df_results, top_n=TOP_N if not SHOW_ALL else len(df_results))
 
+    # ── FASE 5: Auto-Apply (opsional) ────────────────────────────────
+    if auto_apply:
+        _apply_best_params(df_results.iloc[0])
+
     return df_results
 
 
@@ -479,11 +569,10 @@ def _print_top_results(df: pd.DataFrame, top_n: int) -> None:
         f"    python main.py --symbol {OPT_SYMBOL} --tf {OPT_TIMEFRAME} "
         f"--alloc {OPT_TRADE_ALLOCATION}"
     )
-    print(f"  Lalu update settings.json:")
+    print(f"  Atau terapkan otomatis ke settings.json:")
     print(
-        f"    ema_fast={int(best['ema_fast'])}, ema_slow={int(best['ema_slow'])}, "
-        f"adx_threshold={int(best['adx_threshold'])}, "
-        f"bb_std={best['bb_std']:.1f}, rsi_oversold={int(best['rsi_oversold'])}"
+        f"    python optimizer.py --symbol {OPT_SYMBOL} "
+        f"--timeframe {OPT_TIMEFRAME} --auto-apply"
     )
     print(f"{SEP}\n")
 
@@ -491,6 +580,50 @@ def _print_top_results(df: pd.DataFrame, top_n: int) -> None:
 # ============================================================
 # Entry Point
 # ============================================================
+# Entry Point
+# ============================================================
 if __name__ == "__main__":
-    run_optimizer()
+    parser = argparse.ArgumentParser(
+        description="Grid Search Optimizer V3 — Long/Short Regime-Switching Engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default=None,
+        metavar="PAIR",
+        help="Override trading pair (default: %(default)s → gunakan OPT_SYMBOL)",
+    )
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        default=None,
+        metavar="TF",
+        help="Override timeframe, contoh: 1h, 4h, 1d",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override jumlah candle historis yang diambil",
+    )
+    parser.add_argument(
+        "--auto-apply",
+        action="store_true",
+        default=False,
+        help="Tulis parameter terbaik langsung ke settings.json setelah optimasi",
+    )
+
+    args = parser.parse_args()
+
+    # ── Terapkan override CLI ke module globals ───────────────────────
+    if args.symbol:
+        OPT_SYMBOL = args.symbol
+    if args.timeframe:
+        OPT_TIMEFRAME = args.timeframe
+    if args.limit:
+        OPT_LIMIT = args.limit
+
+    run_optimizer(auto_apply=args.auto_apply)
 
