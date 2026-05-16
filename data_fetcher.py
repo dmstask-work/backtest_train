@@ -1,15 +1,32 @@
 """
-Modul Pengambil Data OHLCV (Fase 1).
+Modul Pengambil Data OHLCV dengan Local Cache (v3).
 
-Mengambil data candlestick historis dari exchange menggunakan library ccxt.
-Mendukung switch antara mode Sandbox/Testnet dan Live Account.
+Mengambil data candlestick historis dari exchange menggunakan library ccxt,
+dengan mekanisme Local Disk Cache + Delta Fetching untuk mencegah rate-limit
+selama siklus optimasi otomatis.
 
-v2: Implementasi pagination otomatis untuk melampaui batas 1000 candle
-    per-request yang dikenakan oleh Binance dan sebagian besar exchange.
+Strategi Caching:
+  1. Format    : Parquet (pyarrow/fastparquet) jika tersedia, fallback ke CSV.
+  2. Lokasi    : <project_root>/data/{SYMBOL}_{timeframe}.parquet|.csv
+                 (karakter '/' pada simbol diganti '_', contoh: SOL_USDT_4h)
+  3. Cold Start: Tidak ada cache → ambil penuh dari exchange, simpan ke disk.
+  4. Delta Fetch: Cache ada → muat file, baca timestamp terakhir, ambil HANYA
+                 candle baru dari exchange, gabung + dedup + simpan ulang.
+  5. Output    : DataFrame selalu dipotong ke `limit` baris terbaru sehingga
+                 pemanggil mendapat tepat apa yang diminta.
+
+v3 vs v2:
+  • Tambah _cache_path(), _build_df(), _load_cache(), _save_cache()
+  • Refactor pagination menjadi _fetch_raw_since() (metode internal)
+  • fetch_ohlcv() menjadi orkestrator: cache → delta/full → trim → return
+  • Index tetap tz-naive UTC DatetimeIndex (kompatibel dengan BacktestEngine)
+  • Tidak ada perubahan pada config.py atau modul lainnya
 """
 
+import importlib.util
 import logging
 import time
+from pathlib import Path
 
 import ccxt
 import pandas as pd
@@ -21,10 +38,163 @@ logger = logging.getLogger(__name__)
 # Jumlah candle maksimum per satu request (batas Binance)
 _BATCH_SIZE: int = 1000
 
+# Konfigurasi retry untuk menangani gangguan jaringan transien
+_MAX_RETRIES: int   = 3    # Maksimum percobaan ulang per batch
+_RETRY_DELAY: float = 5.0  # Jeda antar percobaan ulang (detik)
+
+# ── Cache Setup ───────────────────────────────────────────────────────────────
+# Direktori cache relatif terhadap lokasi file ini (bukan cwd) agar aman
+# dijalankan dari crontab atau direktori manapun.
+_CACHE_DIR: Path = Path(__file__).parent / "data"
+
+# Gunakan Parquet jika pyarrow atau fastparquet tersedia; jika tidak, CSV.
+_USE_PARQUET: bool = (
+    importlib.util.find_spec("pyarrow") is not None
+    or importlib.util.find_spec("fastparquet") is not None
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper Fungsi Cache (module-level, tidak butuh instance exchange)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cache_path(symbol: str, timeframe: str) -> Path:
+    """
+    Mengembalikan path file cache untuk pasangan symbol + timeframe.
+
+    '/' dalam nama simbol diganti '_' agar aman sebagai nama file
+    (contoh: SOL/USDT → SOL_USDT → data/SOL_USDT_4h.parquet).
+
+    Args:
+        symbol:    Simbol pasangan trading, contoh: 'SOL/USDT'.
+        timeframe: Timeframe candle, contoh: '4h'.
+
+    Returns:
+        Path objek ke file cache (belum tentu ada di disk).
+    """
+    safe = symbol.replace("/", "_")
+    ext  = ".parquet" if _USE_PARQUET else ".csv"
+    return _CACHE_DIR / f"{safe}_{timeframe}{ext}"
+
+
+def _build_df(raw: list) -> pd.DataFrame:
+    """
+    Mengkonversi list OHLCV mentah dari ccxt menjadi DataFrame berindex waktu.
+
+    Timestamp dikonversi dari milidetik epoch ke datetime tz-naive UTC.
+    Tidak menggunakan utc=True agar index tetap tz-naive (DatetimeTZDtype
+    dihindari karena tidak konsisten dengan pembacaan ulang dari CSV).
+
+    Args:
+        raw: List of lists dari ccxt.fetch_ohlcv() —
+             setiap item: [timestamp_ms, open, high, low, close, volume].
+
+    Returns:
+        DataFrame dengan tz-naive UTC DatetimeIndex bernama 'timestamp'
+        dan kolom float64: open, high, low, close, volume.
+    """
+    df = pd.DataFrame(
+        raw,
+        columns=["timestamp", "open", "high", "low", "close", "volume"],
+    )
+    # unit='ms' tanpa tz= menghasilkan tz-naive UTC (epoch ms → UTC datetime)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    df = df.astype(float)
+    return df
+
+
+def _load_cache(path: Path) -> "pd.DataFrame | None":
+    """
+    Memuat DataFrame dari file cache (Parquet atau CSV).
+
+    Menormalkan index menjadi tz-naive DatetimeIndex setelah memuat,
+    sehingga data dari versi lama (tz-aware) tetap kompatibel.
+
+    Args:
+        path: Path ke file cache yang akan dimuat.
+
+    Returns:
+        DataFrame yang sudah bersih, atau None jika memuat gagal.
+    """
+    try:
+        if path.suffix == ".parquet":
+            df = pd.read_parquet(path)
+        else:
+            # index_col='timestamp' agar index bernama konsisten
+            df = pd.read_csv(path, index_col="timestamp", parse_dates=True)
+
+        if df is None or df.empty:
+            return None
+
+        # ── Normalise index → tz-naive UTC DatetimeIndex ──────────────
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+        # Jika cache lama menyimpan tz-aware, konversi ke tz-naive UTC
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert(None)
+
+        df.index.name = "timestamp"
+        df.sort_index(inplace=True)
+
+        logger.info(
+            "[DataFetcher] Cache dimuat: %s → %d baris (%s hingga %s)",
+            path.name,
+            len(df),
+            df.index[0].strftime("%Y-%m-%d"),
+            df.index[-1].strftime("%Y-%m-%d"),
+        )
+        return df
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[DataFetcher] Gagal memuat cache '%s': %s — akan fetch ulang.",
+            path.name,
+            exc,
+        )
+        return None
+
+
+def _save_cache(df: pd.DataFrame, path: Path) -> None:
+    """
+    Menyimpan DataFrame ke file cache (Parquet atau CSV).
+
+    Direktori dibuat otomatis jika belum ada. Error saat simpan hanya
+    dicatat sebagai warning — tidak menghentikan eksekusi program.
+
+    Args:
+        df:   DataFrame yang akan disimpan (index = tz-naive DatetimeIndex).
+        path: Tujuan file cache.
+    """
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if path.suffix == ".parquet":
+            df.to_parquet(path)
+        else:
+            df.to_csv(path)
+        logger.info(
+            "[DataFetcher] Cache disimpan → %s  (%d baris)", path.name, len(df)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[DataFetcher] Gagal menyimpan cache '%s': %s", path.name, exc
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kelas Utama
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DataFetcher:
     """
-    Kelas untuk mengambil data OHLCV historis dari exchange.
+    Kelas untuk mengambil data OHLCV historis dari exchange dengan cache lokal.
+
+    Alur kerja:
+      1. Periksa apakah file cache ada di data/.
+      2. Jika ada → muat cache, ambil HANYA candle delta (terbaru).
+      3. Jika tidak ada → ambil penuh dari exchange, simpan ke cache.
+      4. Kembalikan N baris terbaru sesuai `limit`.
 
     Mendukung mode koneksi sandbox (testnet) dan live secara transparan.
     Seluruh konfigurasi diambil dari config.py sehingga perpindahan mode
@@ -75,6 +245,8 @@ class DataFetcher:
                 "options": self.cfg.get("options", {}),
                 # Aktifkan rate limiter bawaan ccxt untuk menghindari ban IP
                 "enableRateLimit": True,
+                # Tingkatkan timeout agar tidak langsung gagal pada jaringan lambat
+                "timeout": 30000,  # 30 detik
             }
         )
 
@@ -91,101 +263,87 @@ class DataFetcher:
         return exchange
 
     # ------------------------------------------------------------------
-    # Fungsi Pengambil Data Publik (dengan Pagination)
+    # Pagination Primitif (Internal)
     # ------------------------------------------------------------------
-    def fetch_ohlcv(
+    def _fetch_raw_since(
         self,
-        symbol: str,
+        symbol:    str,
         timeframe: str,
-        limit: int,
-    ) -> pd.DataFrame:
+        since_ms:  int,
+        limit:     int,
+    ) -> list:
         """
-        Mengambil data OHLCV historis dengan pagination otomatis.
+        Mengambil candle dari exchange mulai dari since_ms, hingga `limit` candle.
 
-        Binance (dan sebagian besar exchange) membatasi satu request hanya
-        1000 candle. Fungsi ini mengatasi batasan tersebut dengan looping
-        bertahap menggunakan parameter 'since' (timestamp mundur) hingga
-        jumlah candle yang diminta terpenuhi.
-
-        Mekanisme:
-          1. Hitung titik awal historis: now - (limit × tf_duration_ms)
-          2. Loop: ambil batch 1000 candle, geser 'since' ke depan
-          3. Rate-limit delay di setiap iterasi agar IP tidak diblokir
-          4. Setelah semua batch terkumpul: concat → dedup → sort → trim
+        Ini adalah metode primitif yang hanya menangani komunikasi dengan
+        exchange (pagination + rate-limit). Tidak ada logika cache di sini.
+        Berhenti lebih awal jika exchange mengembalikan batch lebih kecil
+        dari yang diminta (tidak ada lagi data historis).
 
         Args:
-            symbol:    Simbol pasangan trading, contoh: 'BTC/USDT'.
-            timeframe: Timeframe candle, contoh: '1h', '4h', '1d'.
-            limit:     Total candle yang diinginkan (bisa > 1000).
+            symbol:    Simbol pasangan trading, contoh: 'SOL/USDT'.
+            timeframe: Timeframe candle, contoh: '4h'.
+            since_ms:  Timestamp awal dalam milidetik (epoch UTC).
+            limit:     Jumlah maksimum candle yang ingin diambil.
 
         Returns:
-            DataFrame dengan index timestamp (UTC) dan kolom:
-            open, high, low, close, volume. Jumlah baris = min(limit, data tersedia).
+            List of lists OHLCV mentah dari ccxt (bisa lebih sedikit dari limit).
 
         Raises:
             ccxt.NetworkError:  Saat terjadi kesalahan jaringan.
             ccxt.ExchangeError: Saat terjadi kesalahan dari sisi exchange.
-            ValueError:         Jika exchange mengembalikan data kosong sama sekali.
         """
-        logger.info(
-            "[DataFetcher] Memulai pengambilan %d candle | %s [%s] | Exchange: %s",
-            limit,
-            symbol,
-            timeframe,
-            self.cfg["exchange_id"],
-        )
+        tf_ms:       int   = self.exchange.parse_timeframe(timeframe) * 1000
+        rate_delay:  float = max(self.exchange.rateLimit / 1000, 0.5)
 
-        # ── Kalkulasi durasi satu candle dalam milidetik ──────────────
-        # ccxt.Exchange.parse_timeframe() mengembalikan nilai dalam detik
-        tf_seconds: int = self.exchange.parse_timeframe(timeframe)
-        tf_ms:      int = tf_seconds * 1000
-
-        # Jeda minimum antar request (gunakan rateLimit bawaan ccxt,
-        # minimal 500 ms sebagai safety floor untuk mencegah ban IP)
-        rate_delay: float = max(self.exchange.rateLimit / 1000, 0.5)
-
-        # ── Hitung titik awal historis ────────────────────────────────
-        # Mundur sejumlah (limit × durasi_candle) dari waktu sekarang
-        now_ms:    int = self.exchange.milliseconds()
-        since_ms:  int = now_ms - (limit * tf_ms)
-
-        # ── Pagination Loop ───────────────────────────────────────────
-        all_raw:    list = []
-        batch_num:  int  = 0
-        total_batches: int = -(-limit // _BATCH_SIZE)  # ceiling division
+        all_raw:       list = []
+        batch_num:     int  = 0
+        total_batches: int  = max(-(-limit // _BATCH_SIZE), 1)  # ceiling division
+        current_since: int  = since_ms
 
         while len(all_raw) < limit:
-            remaining   = limit - len(all_raw)
-            to_fetch    = min(_BATCH_SIZE, remaining)
-            batch_num  += 1
+            remaining = limit - len(all_raw)
+            to_fetch  = min(_BATCH_SIZE, remaining)
+            batch_num += 1
 
             logger.info(
                 "[DataFetcher] Batch %d/%d | Mengambil %d candle sejak %s ...",
                 batch_num,
                 total_batches,
                 to_fetch,
-                pd.Timestamp(since_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M"),
+                pd.Timestamp(current_since, unit="ms").strftime("%Y-%m-%d %H:%M"),
             )
 
-            try:
-                batch: list = self.exchange.fetch_ohlcv(
-                    symbol,
-                    timeframe,
-                    since=since_ms,
-                    limit=to_fetch,
-                )
-            except ccxt.NetworkError as exc:
-                logger.error(
-                    "[DataFetcher] Kesalahan jaringan pada batch %d: %s",
-                    batch_num, exc,
-                )
-                raise
-            except ccxt.ExchangeError as exc:
-                logger.error(
-                    "[DataFetcher] Kesalahan exchange pada batch %d: %s",
-                    batch_num, exc,
-                )
-                raise
+            # ── Fetch dengan retry + exponential-ish backoff ──────────
+            batch: list = []
+            for attempt in range(1, _MAX_RETRIES + 1):
+                try:
+                    batch = self.exchange.fetch_ohlcv(
+                        symbol,
+                        timeframe,
+                        since=current_since,
+                        limit=to_fetch,
+                    )
+                    break  # sukses — keluar dari loop retry
+                except (
+                    ccxt.RequestTimeout,
+                    ccxt.NetworkError,
+                    ccxt.ExchangeError,
+                ) as exc:
+                    if attempt < _MAX_RETRIES:
+                        logger.warning(
+                            "[DataFetcher] Error jaringan pada batch %d "
+                            "(percobaan %d/%d): %s — retry dalam %.0f detik ...",
+                            batch_num, attempt, _MAX_RETRIES,
+                            exc, _RETRY_DELAY,
+                        )
+                        time.sleep(_RETRY_DELAY)
+                    else:
+                        logger.error(
+                            "[DataFetcher] Batch %d GAGAL setelah %d percobaan: %s",
+                            batch_num, _MAX_RETRIES, exc,
+                        )
+                        raise
 
             if not batch:
                 logger.warning(
@@ -196,17 +354,15 @@ class DataFetcher:
                 break
 
             all_raw.extend(batch)
-
-            # Geser 'since' ke tepat setelah candle terakhir yang diterima
-            since_ms = batch[-1][0] + tf_ms
+            current_since = batch[-1][0] + tf_ms
 
             # Exchange mengembalikan lebih sedikit dari yang diminta →
             # tidak ada lagi data historis di periode ini
             if len(batch) < to_fetch:
                 logger.info(
-                    "[DataFetcher] Exchange mengembalikan %d < %d candle. "
+                    "[DataFetcher] Batch %d: %d < %d candle. "
                     "Batas data historis tercapai.",
-                    len(batch), to_fetch,
+                    batch_num, len(batch), to_fetch,
                 )
                 break
 
@@ -217,47 +373,147 @@ class DataFetcher:
                 )
                 time.sleep(rate_delay)
 
-        # ── Validasi: pastikan setidaknya ada data ────────────────────
-        if not all_raw:
-            raise ValueError(
-                f"Exchange tidak mengembalikan data apapun untuk "
-                f"{symbol} [{timeframe}]. Periksa simbol dan koneksi jaringan."
-            )
+        return all_raw
 
-        # ── Bangun DataFrame dari semua batch ─────────────────────────
-        df = pd.DataFrame(
-            all_raw,
-            columns=["timestamp", "open", "high", "low", "close", "volume"],
+    # ------------------------------------------------------------------
+    # Fungsi Publik Utama — Orkestrator Cache + Fetch
+    # ------------------------------------------------------------------
+    def fetch_ohlcv(
+        self,
+        symbol:    str,
+        timeframe: str,
+        limit:     int,
+    ) -> pd.DataFrame:
+        """
+        Mengambil data OHLCV historis dengan cache lokal + delta fetching.
+
+        Alur kerja:
+          [Cache HIT]
+            1. Muat DataFrame dari data/<symbol>_<tf>.parquet|.csv
+            2. Baca timestamp candle terakhir di cache.
+            3. Estimasi jumlah candle baru (delta) sejak timestamp tersebut.
+            4. Ambil HANYA candle delta dari exchange (hemat kuota API).
+            5. Concat + dedup (keep='last') + sort kronologis.
+            6. Simpan ulang (overwrite) file cache.
+
+          [Cache MISS]
+            1. Ambil penuh `limit` candle menggunakan pagination.
+            2. Simpan ke file cache baru.
+
+          [Output]
+            • Selalu dipotong ke `limit` baris terbaru.
+            • Index: tz-naive UTC DatetimeIndex bernama 'timestamp'.
+            • Kolom: open, high, low, close, volume (semua float64).
+
+        Args:
+            symbol:    Simbol pasangan trading, contoh: 'SOL/USDT'.
+            timeframe: Timeframe candle, contoh: '4h'.
+            limit:     Total candle yang dikembalikan (N baris terbaru).
+
+        Returns:
+            DataFrame dengan index timestamp (UTC, tz-naive) dan kolom OHLCV.
+            Jumlah baris = min(limit, data tersedia).
+
+        Raises:
+            ccxt.NetworkError:  Saat terjadi kesalahan jaringan.
+            ccxt.ExchangeError: Saat terjadi kesalahan dari sisi exchange.
+            ValueError:         Jika tidak ada cache dan exchange kosong.
+        """
+        cache_path = _cache_path(symbol, timeframe)
+        tf_ms: int = self.exchange.parse_timeframe(timeframe) * 1000
+
+        logger.info(
+            "[DataFetcher] fetch_ohlcv(%s, %s, limit=%d) | "
+            "Format cache: %s | File: %s",
+            symbol,
+            timeframe,
+            limit,
+            "parquet" if _USE_PARQUET else "csv",
+            cache_path.name,
         )
 
-        # Konversi timestamp milidetik → datetime UTC dan jadikan index
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df.set_index("timestamp", inplace=True)
+        # ── Coba Muat Cache ───────────────────────────────────────────
+        df_cached: "pd.DataFrame | None" = None
+        if cache_path.exists():
+            df_cached = _load_cache(cache_path)
 
-        # Vectorized cast ke float
-        df = df.astype(float)
+        # ── JALUR A: Cache HIT — Delta Fetch ─────────────────────────
+        if df_cached is not None and not df_cached.empty:
+            last_ts_ms: int = int(df_cached.index[-1].timestamp() * 1000)
+            now_ms:     int = self.exchange.milliseconds()
 
-        # ── Pembersihan Data ──────────────────────────────────────────
-        # 1. Hapus baris duplikat (bisa terjadi di boundary antar batch)
-        rows_before_dedup = len(df)
-        df = df[~df.index.duplicated(keep="last")]
-        dupes_removed = rows_before_dedup - len(df)
-        if dupes_removed > 0:
+            # Estimasi candle dalam delta; +2 = candle berjalan + safety margin.
+            # Mulai dari last_ts_ms (inklusif) agar candle terakhir yang
+            # mungkin masih terbentuk diperbarui dengan data final.
+            delta_est: int = max(int((now_ms - last_ts_ms) / tf_ms) + 2, 1)
+
             logger.info(
-                "[DataFetcher] %d baris duplikat dihapus.", dupes_removed
+                "[DataFetcher] Cache HIT: %d baris dimuat. "
+                "Mengambil delta ~%d candle baru ...",
+                len(df_cached),
+                delta_est,
             )
 
-        # 2. Urutkan kronologis: terlama → terbaru (ascending)
-        df.sort_index(inplace=True)
+            raw_delta = self._fetch_raw_since(
+                symbol, timeframe, last_ts_ms, delta_est
+            )
 
-        # 3. Potong ke jumlah tepat yang diminta (ambil N candle terakhir)
+            if raw_delta:
+                df_delta  = _build_df(raw_delta)
+                new_count = (~df_delta.index.isin(df_cached.index)).sum()
+
+                df = pd.concat([df_cached, df_delta])
+                df = df[~df.index.duplicated(keep="last")]
+                df.sort_index(inplace=True)
+
+                _save_cache(df, cache_path)
+                logger.info(
+                    "[DataFetcher] Delta selesai: +%d candle baru | "
+                    "Total cache: %d baris.",
+                    new_count,
+                    len(df),
+                )
+            else:
+                df = df_cached
+                logger.info(
+                    "[DataFetcher] Tidak ada candle baru dari exchange. "
+                    "Menggunakan cache penuh (%d baris).",
+                    len(df_cached),
+                )
+
+        # ── JALUR B: Cache MISS — Full Fetch ─────────────────────────
+        else:
+            logger.info(
+                "[DataFetcher] Cache MISS. "
+                "Mengambil %d candle penuh dari exchange ...",
+                limit,
+            )
+
+            now_ms:   int = self.exchange.milliseconds()
+            since_ms: int = now_ms - (limit * tf_ms)
+
+            raw = self._fetch_raw_since(symbol, timeframe, since_ms, limit)
+
+            if not raw:
+                raise ValueError(
+                    f"Exchange tidak mengembalikan data apapun untuk "
+                    f"{symbol} [{timeframe}]. "
+                    f"Periksa simbol dan koneksi jaringan."
+                )
+
+            df = _build_df(raw)
+            df = df[~df.index.duplicated(keep="last")]
+            df.sort_index(inplace=True)
+
+            _save_cache(df, cache_path)
+
+        # ── Potong ke N Baris Terbaru yang Diminta ────────────────────
         if len(df) > limit:
             df = df.iloc[-limit:]
 
         logger.info(
-            "[DataFetcher] Selesai: %d candle dalam %d batch | %s → %s",
+            "[DataFetcher] Selesai: %d candle | %s → %s",
             len(df),
-            batch_num,
             df.index[0].strftime("%Y-%m-%d %H:%M UTC"),
             df.index[-1].strftime("%Y-%m-%d %H:%M UTC"),
         )

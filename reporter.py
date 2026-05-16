@@ -199,6 +199,10 @@ class PerformanceReporter:
             "directional_breakdown": directional_breakdown,
             "strategy_breakdown":    strategy_breakdown,
             "exit_breakdown":        exit_breakdown,
+            # Raw trade list disertakan agar print_report() / export_trades_to_csv()
+            # dapat mengaksesnya tanpa perlu meneruskan variabel terpisah.
+            # Dikecualikan dari JSON output (lihat print_report).
+            "raw_trades":            trades,
         }
 
     # ==================================================================
@@ -206,20 +210,23 @@ class PerformanceReporter:
     # ==================================================================
     def print_report(
         self,
-        metrics:   Dict[str, Any],
-        symbol:    str,
-        timeframe: str,
-        mode:      str,
+        metrics:    Dict[str, Any],
+        symbol:     str,
+        timeframe:  str,
+        mode:       str,
+        export_csv: bool = False,
     ) -> None:
         """
         Mencetak laporan performa ke terminal dalam format teks terstruktur
         diikuti output JSON lengkap untuk konsumsi AI Agent.
 
         Args:
-            metrics:   Dictionary metrik dari calculate_metrics().
-            symbol:    Simbol pasangan trading yang digunakan.
-            timeframe: Timeframe candle yang digunakan.
-            mode:      Mode exchange aktif ('sandbox' atau 'live').
+            metrics:    Dictionary metrik dari calculate_metrics().
+            symbol:     Simbol pasangan trading yang digunakan.
+            timeframe:  Timeframe candle yang digunakan.
+            mode:       Mode exchange aktif ('sandbox' atau 'live').
+            export_csv: Jika True, ekspor trade ledger ke trade_history.csv
+                        melalui export_trades_to_csv().
         """
         W    = 72
         SEP  = "=" * W
@@ -324,8 +331,15 @@ class PerformanceReporter:
         print(f"\n{SEP}")
         print(f"{'JSON OUTPUT  (AI Agent / AionUi)':^{W}}")
         print(SEP)
-        print(json.dumps(metrics, indent=2, ensure_ascii=False))
+        # raw_trades dikecualikan dari JSON: berisi pd.Timestamp yang tidak
+        # JSON-serializable dan dapat membuat output sangat panjang.
+        metrics_for_json = {k: v for k, v in metrics.items() if k != "raw_trades"}
+        print(json.dumps(metrics_for_json, indent=2, ensure_ascii=False))
         print(f"{SEP}\n")
+
+        # ── Ekspor CSV (opsional) ─────────────────────────────────────
+        if export_csv and "raw_trades" in metrics:
+            self.export_trades_to_csv(metrics["raw_trades"])
 
     # ==================================================================
     # Cetak Daftar Trade Detail
@@ -378,3 +392,47 @@ class PerformanceReporter:
             )
 
         print(f"  {'─' * W_LINE}\n")
+
+    # ==================================================================
+    # Ekspor Trade Ledger ke CSV
+    # ==================================================================
+    def export_trades_to_csv(
+        self,
+        trades:   List[Dict[str, Any]],
+        filepath: str = "trade_history.csv",
+    ) -> None:
+        """
+        Mengekspor daftar trade ke file CSV untuk analisis offline.
+
+        Kolom waktu (signal_time, entry_time, exit_time) dikonversi ke
+        format ISO-8601 string agar mudah dibaca di Excel dan tool lainnya.
+        Semua field dari trade_record BacktestEngine ditulis apa adanya.
+
+        Args:
+            trades:   Daftar catatan trade dari BacktestEngine.run().
+            filepath: Path tujuan file CSV.
+                      Default: 'trade_history.csv' di direktori kerja.
+        """
+        if not trades:
+            logger.warning(
+                "[Reporter] Tidak ada trade untuk diekspor ke CSV."
+            )
+            return
+
+        df = pd.DataFrame(trades)
+
+        # ── Konversi kolom waktu ke ISO-8601 string ───────────────────
+        # pd.Timestamp, datetime, dan string mentah semuanya ditangani
+        # secara seragam via pd.Timestamp(v).isoformat().
+        for col in ("signal_time", "entry_time", "exit_time"):
+            if col in df.columns:
+                df[col] = df[col].apply(
+                    lambda v: pd.Timestamp(v).isoformat() if pd.notna(v) else ""
+                )
+
+        df.to_csv(filepath, index=False)
+        logger.info(
+            "[Reporter] Trade ledger disimpan \u2192 %s  (%d baris)",
+            filepath,
+            len(df),
+        )

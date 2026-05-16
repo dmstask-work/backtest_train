@@ -28,14 +28,17 @@ Pembaruan V3 (dibanding V2):
 
 Alur Kerja:
   1. Ambil data OHLCV SATU kali (hemat kuota API)
-  2. Buat semua kombinasi parameter (grid) via itertools.product
-  3. Untuk setiap kombinasi yang valid:
+  2. Split kronologis: 70% TRAIN (in-sample) | 30% TEST (out-of-sample)
+  3. Buat semua kombinasi parameter (grid) via itertools.product
+  4. Grid search HANYA pada data TRAIN:
        a. Hitung ulang indikator (vectorized, sangat cepat)
        b. Klasifikasi regime (ADX threshold)
        c. Generate sinyal LONG + SHORT via kedua strategi
        d. Jalankan BacktestEngine v3 (slippage + pending order)
        e. Catat metrik: PnL, Sharpe, WR, DD, PF, Long/Short breakdown
-  4. Urutkan hasil, cetak Top N
+  5. Urutkan TRAIN results, cetak Top N
+  6. Validasi OOS: jalankan parameter #1 SEKALI pada data TEST (unseen)
+  7. Auto-Apply HANYA jika OOS net_pnl > 0 dan profit_factor > 1.0
 """
 
 import argparse
@@ -85,6 +88,11 @@ PARAM_GRID: dict = {
     "bb_std":        [2.0, 2.5],            # Std dev Bollinger Bands
     "rsi_oversold":  [25, 30],              # Batas RSI oversold (MR LONG)
 }
+
+# ── Validasi In-Sample / Out-of-Sample (OOS) ────────────────────────
+# 0.30 = 30% data terbaru dijaga sebagai unseen test set
+# Grid search HANYA berjalan pada 70% pertama (TRAIN)
+OPT_OOS_RATIO: float = 0.30
 
 # ── Output ────────────────────────────────────────────────────────────
 TOP_N:    int  = 5       # Tampilkan N kombinasi terbaik
@@ -319,6 +327,85 @@ def _apply_best_params(best: "pd.Series") -> None:
 
 
 # ============================================================
+# Validasi Out-of-Sample — Cetak Hasil & Verdict
+# ============================================================
+def _print_oos_results(oos: dict[str, Any], best: pd.Series) -> bool:
+    """
+    Mencetak blok validasi Out-of-Sample dan mengembalikan status kelulusan.
+
+    Kriteria LULUS: net_pnl > 0 DAN profit_factor > 1.0 pada data test.
+    Jika backtest OOS mengembalikan error, secara otomatis dinyatakan GAGAL.
+
+    Args:
+        oos:  Hasil _run_single_backtest pada df_test (unseen data).
+        best: Row #1 dari df_results (kombinasi parameter terbaik TRAIN).
+
+    Returns:
+        True jika parameter lulus validasi OOS, False jika gagal.
+    """
+    W    = 96
+    SEP  = "=" * W
+    DASH = "\u2500" * (W - 4)
+
+    # ── Tentukan status kelulusan ─────────────────────────────────────
+    if "error" in oos:
+        passed = False
+    else:
+        passed = (
+            oos.get("net_pnl",       -1.0) > 0
+            and oos.get("profit_factor", 0.0) > 1.0
+        )
+
+    if passed:
+        verdict = "\u2714  LULUS \u2014 Parameter bertahan pada data unseen  (net_pnl > 0 & PF > 1.0)"
+    else:
+        verdict = "\u2718  GAGAL \u2014 Parameter tidak bertahan pada data Out-of-Sample"
+
+    # ── Header ───────────────────────────────────────────────────────
+    print(f"\n{SEP}")
+    print(f"  FASE 4b \u2014 VALIDASI OUT-OF-SAMPLE  (Anti-Overfitting Check)".center(W))
+    print(SEP)
+    print(f"  Parameter Uji (kombinasi #1 dari TRAIN):")
+    print(
+        f"    ema_fast={int(best['ema_fast'])}  "
+        f"ema_slow={int(best['ema_slow'])}  "
+        f"adx_threshold={int(best['adx_threshold'])}  "
+        f"bb_std={best['bb_std']:.1f}  "
+        f"rsi_oversold={int(best['rsi_oversold'])}"
+    )
+    print(f"  {DASH}")
+    print(
+        f"  Hasil pada Data TEST "
+        f"({OPT_OOS_RATIO * 100:.0f}% candle terbaru \u2014 belum pernah dilihat optimizer):"
+    )
+
+    # ── Metrik OOS ───────────────────────────────────────────────────
+    if "error" in oos:
+        print(f"    ERROR  : {oos['error']}")
+    else:
+        pf_val = oos["profit_factor"]
+        pf_str = f"{pf_val:.4f}" if pf_val > 0 else "0.0000"
+        print(f"    Net PnL       : ${oos['net_pnl']:>+.4f}")
+        print(f"    Win Rate      :  {oos['win_rate']:.2f}%")
+        print(f"    Sharpe Ratio  :  {oos['sharpe_ratio']:.4f}  (per-candle | RF=0%)")
+        print(f"    Max Drawdown  :  {oos['max_drawdown']:.2f}%")
+        print(f"    Profit Factor :  {pf_str}")
+        print(f"    Total Trades  :  {int(oos['total_trades'])}")
+        print(
+            f"    Directional   :  "
+            f"LONG {int(oos['long_trades'])} trade(s) WR={oos['long_win_rate']:.1f}%  |  "
+            f"SHORT {int(oos['short_trades'])} trade(s) WR={oos['short_win_rate']:.1f}%"
+        )
+
+    # ── Verdict ──────────────────────────────────────────────────────
+    print(f"  {DASH}")
+    print(f"  Verdict  :  {verdict}")
+    print(f"{SEP}\n")
+
+    return passed
+
+
+# ============================================================
 # Fungsi Utama Optimizer
 # ============================================================
 def run_optimizer(auto_apply: bool = False) -> pd.DataFrame:
@@ -342,6 +429,7 @@ def run_optimizer(auto_apply: bool = False) -> pd.DataFrame:
     print(f"  Slippage      : {OPT_SLIPPAGE_RATE * 100:.2f}% per sisi")
     print(f"  Strategi      : TREND-FOLLOWING + MEAN-REVERSION  (regime switching)")
     print(f"  Urut berdasar : {SORT_BY.upper()}")
+    print(f"  OOS Ratio     : {OPT_OOS_RATIO * 100:.0f}% test  /  {(1.0 - OPT_OOS_RATIO) * 100:.0f}% train  (anti-overfitting)")
     print(f"  Grid:")
     print(f"    ema_fast      : {PARAM_GRID['ema_fast']}")
     print(f"    ema_slow      : {PARAM_GRID['ema_slow']}")
@@ -370,6 +458,18 @@ def run_optimizer(auto_apply: bool = False) -> pd.DataFrame:
         len(df_raw), t_fetch_elapsed,
     )
 
+    # ── Split In-Sample (TRAIN) / Out-of-Sample (TEST) ────────────────
+    # Pembagian kronologis: TRAIN = candle lama, TEST = candle terbaru
+    _split_idx = int(len(df_raw) * (1.0 - OPT_OOS_RATIO))
+    df_train   = df_raw.iloc[:_split_idx].copy()
+    df_test    = df_raw.iloc[_split_idx:].copy()
+
+    opt_logger.info(
+        "[FASE 1] Split — TRAIN: %d candle (%.0f%%) | TEST: %d candle (%.0f%%)",
+        len(df_train), (1.0 - OPT_OOS_RATIO) * 100,
+        len(df_test),  OPT_OOS_RATIO * 100,
+    )
+
     # ── FASE 2: Bangun Grid Semua Kombinasi ───────────────────────────
     keys   = list(PARAM_GRID.keys())
     values = list(PARAM_GRID.values())
@@ -388,7 +488,10 @@ def run_optimizer(auto_apply: bool = False) -> pd.DataFrame:
     )
 
     # ── FASE 3: Loop Backtest ─────────────────────────────────────────
-    opt_logger.info("[FASE 3] Memulai iterasi backtest ...\n")
+    opt_logger.info(
+        "[FASE 3] Memulai grid search pada data TRAIN (%d candle) ...\n",
+        len(df_train),
+    )
 
     results_log: list[dict[str, Any]] = []
     t_loop_start = time.perf_counter()
@@ -418,7 +521,7 @@ def run_optimizer(auto_apply: bool = False) -> pd.DataFrame:
         })
 
         t0      = time.perf_counter()
-        outcome = _run_single_backtest(df_raw, ind_cfg, adx_threshold=adx_th)
+        outcome = _run_single_backtest(df_train, ind_cfg, adx_threshold=adx_th)
         elapsed = time.perf_counter() - t0
 
         if "error" in outcome:
@@ -455,16 +558,38 @@ def run_optimizer(auto_apply: bool = False) -> pd.DataFrame:
         )
         sys.exit(1)
 
-    # ── FASE 4: Ranking & Output ──────────────────────────────────────
+    # ── FASE 4a: Ranking & Output (TRAIN results) ───────────────────
     df_results = pd.DataFrame(results_log)
     df_results.sort_values(by=SORT_BY, ascending=False, inplace=True)
     df_results.reset_index(drop=True, inplace=True)
 
     _print_top_results(df_results, top_n=TOP_N if not SHOW_ALL else len(df_results))
 
-    # ── FASE 5: Auto-Apply (opsional) ────────────────────────────────
+    # ── FASE 4b: Validasi Out-of-Sample ──────────────────────────────
+    best_row = df_results.iloc[0]
+    best_cfg = _build_indicator_config({
+        "ema_fast":      int(best_row["ema_fast"]),
+        "ema_slow":      int(best_row["ema_slow"]),
+        "adx_threshold": int(best_row["adx_threshold"]),
+        "bb_std":        float(best_row["bb_std"]),
+        "rsi_oversold":  int(best_row["rsi_oversold"]),
+    })
+
+    opt_logger.info("[FASE 4b] Menjalankan validasi Out-of-Sample pada %d candle ...", len(df_test))
+    oos_result = _run_single_backtest(
+        df_test, best_cfg, adx_threshold=int(best_row["adx_threshold"])
+    )
+    oos_passed = _print_oos_results(oos_result, best_row)
+
+    # ── FASE 5: Auto-Apply (bersyarat — hanya jika OOS lulus) ─────────
     if auto_apply:
-        _apply_best_params(df_results.iloc[0])
+        if oos_passed:
+            _apply_best_params(df_results.iloc[0])
+        else:
+            opt_logger.error(
+                "Auto-Apply DIBATALKAN: Parameter terbaik GAGAL validasi "
+                "Out-of-Sample. settings.json tidak diubah."
+            )
 
     return df_results
 
@@ -489,7 +614,7 @@ def _print_top_results(df: pd.DataFrame, top_n: int) -> None:
 
     print(f"\n{SEP}")
     print(
-        f"  {label} KOMBINASI PARAMETER TERBAIK  "
+        f"  {label} KOMBINASI TERBAIK \u2014 HASIL TRAIN  "
         f"(diurutkan: {SORT_BY.upper()})".center(W)
     )
     print(SEP)
@@ -577,8 +702,6 @@ def _print_top_results(df: pd.DataFrame, top_n: int) -> None:
     print(f"{SEP}\n")
 
 
-# ============================================================
-# Entry Point
 # ============================================================
 # Entry Point
 # ============================================================

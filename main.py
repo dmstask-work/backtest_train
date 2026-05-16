@@ -366,6 +366,7 @@ def run_backtest(cfg: dict, show_trade_list: bool = True) -> dict:
             symbol    = cfg["symbol"],
             timeframe = cfg["timeframe"],
             mode      = cfg["exchange_mode"],
+            export_csv= True,  # CSV Audit trail dihidupkan untuk AI
         )
 
         if show_trade_list and results["trades"]:

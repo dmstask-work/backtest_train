@@ -56,29 +56,38 @@ class BacktestEngine:
 
     def __init__(
         self,
-        initial_capital:  float            = BACKTEST_CONFIG["initial_capital"],
-        trade_allocation: float            = BACKTEST_CONFIG["trade_allocation"],
-        fee_rate:         float            = BACKTEST_CONFIG["fee_rate"],
-        slippage_rate:    float            = 0.0005,
-        risk_manager:     Optional[RiskManager] = None,
+        initial_capital:           float                 = BACKTEST_CONFIG["initial_capital"],
+        trade_allocation:          float                 = BACKTEST_CONFIG["trade_allocation"],
+        fee_rate:                  float                 = BACKTEST_CONFIG["fee_rate"],
+        slippage_rate:             float                 = 0.0005,
+        funding_rate_per_interval: float                 = BACKTEST_CONFIG.get("funding_rate_per_interval", 0.0001),
+        funding_interval_hours:    int                   = 8,
+        risk_manager:              Optional[RiskManager] = None,
     ) -> None:
         """
         Inisialisasi mesin backtesting v3.
 
         Args:
-            initial_capital:  Modal awal simulasi (USD).
-            trade_allocation: Fraksi modal yang dipakai per trade (0.0–1.0).
-            fee_rate:         Biaya transaksi per sisi (0.001 = 0.1%).
-            slippage_rate:    Degradasi harga akibat slippage per sisi
-                              (0.0005 = 0.05%). Entry: harga naik sebesar ini.
-                              Exit: harga turun sebesar ini.
-            risk_manager:     Instance RiskManager. Dibuat otomatis jika None.
+            initial_capital:           Modal awal simulasi (USD).
+            trade_allocation:          Fraksi modal yang dipakai per trade (0.0–1.0).
+            fee_rate:                  Biaya transaksi per sisi (0.001 = 0.1%).
+            slippage_rate:             Degradasi harga akibat slippage per sisi
+                                       (0.0005 = 0.05%). Entry: harga naik sebesar
+                                       ini. Exit: harga turun sebesar ini.
+            funding_rate_per_interval: Biaya funding per interval pembayaran
+                                       (0.0001 = 0.01% per interval). Dihitung
+                                       berdasarkan durasi aktual trade.
+            funding_interval_hours:    Jarak antar pembayaran funding dalam jam
+                                       (default: 8 jam — standar kripto perpetual).
+            risk_manager:              Instance RiskManager. Dibuat otomatis jika None.
         """
-        self.initial_capital  = initial_capital
-        self.trade_allocation = trade_allocation
-        self.fee_rate         = fee_rate
-        self.slippage_rate    = slippage_rate
-        self.risk_manager     = risk_manager or RiskManager()
+        self.initial_capital           = initial_capital
+        self.trade_allocation          = trade_allocation
+        self.fee_rate                  = fee_rate
+        self.slippage_rate             = slippage_rate
+        self.funding_rate_per_interval = funding_rate_per_interval
+        self.funding_interval_hours    = funding_interval_hours
+        self.risk_manager              = risk_manager or RiskManager()
 
         # State internal — di-reset di setiap pemanggilan run()
         self._capital:       float               = initial_capital
@@ -115,12 +124,15 @@ class BacktestEngine:
 
         logger.info(
             "[BacktestEngine] Mulai simulasi | %d candle | "
-            "Modal: $%.2f | Alokasi: %.0f%% | Fee: %.2f%% | Slippage: %.2f%%",
+            "Modal: $%.2f | Alokasi: %.0f%% | Fee: %.2f%% | "
+            "Slippage: %.2f%% | Funding: %.4f%% per %dh",
             len(df),
             self.initial_capital,
             self.trade_allocation * 100,
             self.fee_rate * 100,
             self.slippage_rate * 100,
+            self.funding_rate_per_interval * 100,
+            self.funding_interval_hours,
         )
 
         for row in df.itertuples():
@@ -362,6 +374,12 @@ class BacktestEngine:
           LONG  → gross_pnl = (exit − entry) × qty   [profit saat harga naik]
           SHORT → gross_pnl = (entry − exit) × qty   [profit saat harga turun]
 
+        Biaya yang dikurangi dari gross_pnl:
+          entry_fee    = qty × entry_price × fee_rate
+          exit_fee     = qty × exec_price  × fee_rate
+          funding_fee  = (qty × entry_price) × funding_rate_per_interval
+                         × (duration_hours / funding_interval_hours)
+
         Args:
             idx:               Timestamp penutupan posisi.
             exec_price:        Harga eksekusi exit aktual (sudah terdegradasi slippage).
@@ -381,7 +399,21 @@ class BacktestEngine:
             (exec_price - pos["entry_price"]) * pos["quantity"] if is_long
             else (pos["entry_price"] - exec_price) * pos["quantity"]
         )
-        total_fees: float = pos["entry_fee"] + exit_fee
+
+        # ── Funding Rate Fee (Perpetual Futures Degradasi) ───────────────
+        # Pendekatan analitik: biaya dihitung sekaligus saat posisi ditutup
+        # berdasarkan durasi aktual (bukan per candle) untuk efisiensi.
+        # Nominal = qty × entry_price (notional value posisi saat dibuka).
+        # Pendekatan konservatif: funding dikurangi dari SEMUA posisi
+        # (mencerminkan worst-case longs-pay-shorts di pasar bullish).
+        duration_hours: float = (
+            (idx - pos["entry_time"]).total_seconds() / 3600.0
+        )
+        num_intervals:  float = duration_hours / self.funding_interval_hours
+        nominal:        float = pos["quantity"] * pos["entry_price"]
+        funding_fee:    float = nominal * self.funding_rate_per_interval * num_intervals
+
+        total_fees: float = pos["entry_fee"] + exit_fee + funding_fee
         net_pnl:    float = gross_pnl - total_fees
 
         # Kembalikan modal: saldo bebas + trade_capital + net_pnl
@@ -406,8 +438,9 @@ class BacktestEngine:
             "risk_reward":       pos["risk_reward"],
             # ── PnL ──────────────────────────────────────────────────
             "exit_reason":       exit_reason,
-            "gross_pnl":         gross_pnl,
-            "total_fees":        total_fees,
+            "gross_pnl":         gross_pnl,            "entry_fee":         pos["entry_fee"],
+            "exit_fee":          exit_fee,
+            "funding_fee":       funding_fee,            "total_fees":        total_fees,
             "net_pnl":           net_pnl,
             "outcome":           "WIN" if net_pnl > 0 else "LOSS",
             # ── Diagnostik Slippage ───────────────────────────────────
