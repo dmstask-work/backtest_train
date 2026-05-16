@@ -1,70 +1,56 @@
 {
   "_comment": "File konfigurasi eksternal untuk sistem Backtesting Adaptif. Edit file ini untuk tuning parameter tanpa menyentuh kode Python.",
-
   "exchange": {
     "_comment": "mode: 'sandbox' untuk testnet, 'live' untuk akun nyata",
     "mode": "sandbox",
     "exchange_id": "binance"
   },
-
   "backtest": {
     "symbol": "BTC/USDT",
     "timeframe": "1h",
     "limit": 1000,
     "initial_capital": 1000.0,
-    "trade_allocation": 0.10,
+    "trade_allocation": 0.1,
     "fee_rate": 0.001
   },
-
   "strategies": {
     "_comment": "Saklar on/off per strategi. Matikan salah satu untuk A/B testing.",
     "enable_trend_following": true,
     "enable_mean_reversion": true
   },
-
   "indicators": {
     "_comment_adx": "ADX — Market Regime Filter. Naikkan threshold (misal 30) untuk hanya trade di tren yang sangat kuat.",
     "adx_period": 14,
-    "adx_threshold": 25,
-
+    "adx_threshold": 20,
     "_comment_ema": "EMA — Trend-Following. Untuk ETH choppy, coba ema_fast=34 ema_slow=89 (Fibonacci).",
     "ema_fast": 20,
-    "ema_slow": 50,
-
+    "ema_slow": 100,
     "_comment_macd": "MACD — Konfirmasi momentum. Default standar industri.",
     "macd_fast": 12,
     "macd_slow": 26,
     "macd_signal": 9,
-
     "_comment_supertrend": "Supertrend — Filter anti-whipsaw untuk Trend-Following. Naikkan multiplier untuk lebih longgar, turunkan untuk lebih ketat.",
     "supertrend_period": 10,
     "supertrend_multiplier": 3.0,
-
     "_comment_bb": "Bollinger Bands — Mean-Reversion. Naikkan std ke 2.5 untuk BTC yang lebih volatile.",
     "bb_period": 20,
-    "bb_std": 2.0,
-
+    "bb_std": 2.5,
     "_comment_bandwidth": "Filter Bandwidth BB. Nilai 1.2 berarti MR hanya aktif jika bandwidth < 120% dari rata-ratanya (tidak sedang expanding tajam). Turunkan ke 1.0 untuk lebih konservatif.",
     "bb_bandwidth_expansion_factor": 1.2,
-
     "_comment_rsi": "RSI — Konfirmasi oversold/overbought.",
     "rsi_period": 14,
     "rsi_oversold": 30,
     "rsi_overbought": 70,
-
     "_comment_atr": "ATR — Kalkulasi SL/TP dinamis.",
     "atr_period": 14,
-
     "_comment_volume": "Volume SMA — Filter fake breakout. Sinyal hanya valid jika volume candle > rata-rata volume N periode terakhir.",
     "volume_sma_period": 20
   },
-
   "risk": {
     "_comment": "Risk/Reward ratio default = 1:2. Ubah tp_multiplier ke 4.5 untuk crypto yang lebih trendy seperti SOL.",
     "sl_multiplier": 1.5,
     "tp_multiplier": 3.0
   },
-
   "profiles": {
     "_comment": "Profil preset untuk symbol berbeda. Gunakan --profile via CLI untuk memuat preset ini.",
     "BTC": {
@@ -74,7 +60,7 @@
       "supertrend_period": 10,
       "supertrend_multiplier": 3.0,
       "bb_bandwidth_expansion_factor": 1.2,
-      "trade_allocation": 0.10
+      "trade_allocation": 0.1
     },
     "ETH": {
       "_comment": "ETH lebih choppy — ADX threshold lebih tinggi, supertrend lebih ketat.",

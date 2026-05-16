@@ -2,3 +2,7 @@ __pycache__/
 .aionrs/
 bot-env/
 
+
+logs/
+data/
+trade_history.csv

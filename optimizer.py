@@ -102,18 +102,21 @@ SHOW_ALL: bool = False   # True = tampilkan semua hasil, bukan hanya Top N
 # ============================================================
 # Setup Logging — Hanya optimizer yang INFO, semua modul diam
 # ============================================================
+Path("logs").mkdir(exist_ok=True)
+_OPT_FMT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 logging.basicConfig(
     level=logging.WARNING,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    format=_OPT_FMT,
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("logs/optimizer_walkforward.log", encoding="utf-8"),
+    ],
 )
 opt_logger = logging.getLogger("optimizer")
 opt_logger.setLevel(logging.INFO)
 _handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(
-    logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", "%H:%M:%S")
-)
+_handler.setFormatter(logging.Formatter(_OPT_FMT, "%Y-%m-%d %H:%M:%S"))
 opt_logger.addHandler(_handler)
 opt_logger.propagate = False
 

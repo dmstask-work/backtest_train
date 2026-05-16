@@ -393,11 +393,17 @@ if __name__ == "__main__":
     args   = parser.parse_args()
 
     # ── 2. Setup logging sesuai level dari CLI ────────────────────────
+    Path("logs").mkdir(exist_ok=True)
+    _log_fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    _log_lvl = getattr(logging, args.log_level)
     logging.basicConfig(
-        level   = getattr(logging, args.log_level),
-        format  = "%(asctime)s | %(levelname)-8s | %(name)-22s | %(message)s",
+        level   = _log_lvl,
+        format  = _log_fmt,
         datefmt = "%Y-%m-%d %H:%M:%S",
-        handlers= [logging.StreamHandler(sys.stdout)],
+        handlers= [
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("logs/main_execution.log", encoding="utf-8"),
+        ],
     )
     logger = logging.getLogger(__name__)
 
