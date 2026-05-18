@@ -42,7 +42,7 @@ from pathlib import Path
 import ccxt
 import pandas as pd
 
-from config import BACKTEST_CONFIG, INDICATOR_CONFIG, RISK_CONFIG
+from config import BACKTEST_CONFIG, EXCHANGE_CONFIG, EXCHANGE_MODE, INDICATOR_CONFIG, RISK_CONFIG
 from indicators import IndicatorCalculator
 from regime_filter import RegimeFilter
 from risk_manager import RiskManager
@@ -96,49 +96,88 @@ _ENABLE_MEAN_REV: bool = bool(_stg.get("enable_mean_reversion",  True))
 # =============================================================================
 # Exchange Initialization
 # =============================================================================
-def _init_exchange(dry_run: bool = False) -> ccxt.binance:
+def _init_exchange(dry_run: bool = False) -> ccxt.Exchange:
     """
-    Inisialisasi koneksi ke Binance USDM Futures (Perpetual Contracts).
+    Inisialisasi koneksi ke exchange secara 100% dinamis berdasarkan config.
 
-    Menggunakan ccxt.binance dengan defaultType='future' agar semua operasi
-    (fetch_ohlcv, fetch_positions, create_order) bekerja di konteks futures.
-    API credentials dibaca eksklusif dari environment variable.
+    Tidak ada hardcode nama bursa, tipe market, maupun prefix env var —
+    semua parameter diturunkan dari settings.json via config.py:
 
-    Saat dry_run=True, API key tidak diwajibkan karena fetch_ohlcv adalah
-    endpoint publik yang tidak memerlukan autentikasi.
+      exchange_id : settings.json["exchange"]["exchange_id"]  (mis. "binance", "bybit")
+      market_type : settings.json["backtest"]["market_type"]  (mis. "swap", "future", "spot")
+      use_testnet : settings.json["backtest"]["use_testnet"]  (True / False)
+
+    Env var API key dibangun dinamis:
+      {EXCHANGE_ID_UPPER}_API_KEY / {EXCHANGE_ID_UPPER}_API_SECRET
+      Contoh: binance → BINANCE_API_KEY, bybit → BYBIT_API_KEY
+
+    Saat dry_run=True, validasi API key dilewati karena fetch_ohlcv
+    adalah endpoint publik yang tidak memerlukan autentikasi.
 
     Args:
-        dry_run: Jika True, lewati validasi API key (mode paper trading).
+        dry_run: Jika True, skip validasi API key (mode paper trading).
 
     Returns:
-        Instance ccxt.binance yang dikonfigurasi untuk USDM Futures.
+        Instance ccxt.Exchange yang siap digunakan.
 
     Raises:
-        SystemExit: Jika bukan dry_run dan API key tidak ada di environment.
+        SystemExit: Jika exchange_id tidak dikenal CCXT, atau API key
+                    tidak ada di environment saat bukan dry_run.
     """
-    api_key    = os.getenv("BINANCE_API_KEY", "")
-    api_secret = os.getenv("BINANCE_API_SECRET", "")
+    # ── Baca parameter dari config ───────────────────────────────────────
+    # exchange_id tersimpan di EXCHANGE_CONFIG[mode], bukan di BACKTEST_CONFIG
+    exch_id     = EXCHANGE_CONFIG.get(EXCHANGE_MODE, {}).get("exchange_id", "binance").lower()
+    mkt_type    = str(BACKTEST_CONFIG.get("market_type",  "swap"))
+    use_testnet = bool(BACKTEST_CONFIG.get("use_testnet", False))
 
-    if not dry_run and (not api_key or not api_secret):
+    # ── Resolusi kelas CCXT secara dinamis ──────────────────────────────
+    # getattr(ccxt, "binance") → ccxt.binance
+    # getattr(ccxt, "bybit")   → ccxt.bybit  … dst.
+    exchange_class = getattr(ccxt, exch_id, None)
+    if exchange_class is None:
         logger.error(
-            "[Exchange] BINANCE_API_KEY atau BINANCE_API_SECRET tidak ditemukan "
-            "di environment variable. Set kedua variabel tersebut sebelum "
-            "menjalankan live_bot.py."
+            "[Exchange] '%s' tidak dikenal oleh library CCXT. "
+            "Periksa nilai 'exchange_id' di settings.json.",
+            exch_id,
         )
         sys.exit(1)
 
-    exchange = ccxt.binance({
+    # ── Baca API credentials dari env var secara dinamis ────────────────
+    # Pola: {EXCHANGE_UPPER}_API_KEY  /  {EXCHANGE_UPPER}_API_SECRET
+    env_prefix = exch_id.upper()
+    api_key    = os.getenv(f"{env_prefix}_API_KEY",    "")
+    api_secret = os.getenv(f"{env_prefix}_API_SECRET", "")
+
+    if not dry_run and (not api_key or not api_secret):
+        logger.error(
+            "[Exchange] %s_API_KEY atau %s_API_SECRET tidak ditemukan "
+            "di environment variable. Set kedua variabel sebelum menjalankan "
+            "live_bot.py.",
+            env_prefix, env_prefix,
+        )
+        sys.exit(1)
+
+    # ── Inisialisasi instance exchange ─────────────────────────────────
+    exchange: ccxt.Exchange = exchange_class({
         "apiKey":          api_key,
         "secret":          api_secret,
         "enableRateLimit": True,
         "options": {
-            "defaultType": "future",  # USDM Perpetual Futures — market asli
+            "defaultType": mkt_type,
         },
     })
 
+    # ── Testnet (opsional, independen dari --dry-run) ───────────────────
+    # Dry-run tetap konek ke market ASLI agar data OHLCV akurat.
+    # Testnet diaktifkan hanya jika "use_testnet": true ada di settings.json.
+    if use_testnet:
+        exchange.set_sandbox_mode(True)
+        logger.info("[Exchange] Testnet / Sandbox AKTIF (set_sandbox_mode=True).")
+
     logger.info(
-        "[Exchange] Binance USDM Futures diinisialisasi | symbol=%s | tf=%s | dry_run=%s",
-        _SYMBOL, _TIMEFRAME, dry_run,
+        "[Exchange] %s diinisialisasi | mode=%s | mkt_type=%s | "
+        "testnet=%s | dry_run=%s",
+        exch_id, EXCHANGE_MODE, mkt_type, use_testnet, dry_run,
     )
     return exchange
 
@@ -172,7 +211,10 @@ def fetch_live_ohlcv(
         ccxt.ExchangeError: Error dari exchange; diteruskan ke caller.
         ValueError:         Exchange mengembalikan data kosong.
     """
-    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe)
+    if raw and len(raw) > limit:
+        raw = raw[-limit:]
+
     if not raw:
         raise ValueError(
             f"Exchange mengembalikan data kosong untuk {symbol} / {timeframe}."
